@@ -1,5 +1,4 @@
 # inputfile.py
-
 from music21 import converter, note, chord, articulations
 from models import BiLSTMWithAttention
 import torch
@@ -14,7 +13,9 @@ from data_utils import (
     calculate_speed_features,
     calculate_midi_diff,
     create_word_column,
-    is_black_key
+    is_black_key,
+    normalize_spelled_pitch,        # 导入标准化函数
+    denormalize_spelled_pitch     # 导入还原函数
 )
 from sklearn.preprocessing import StandardScaler
 from gensim.models import Word2Vec
@@ -43,11 +44,14 @@ def preprocess_input_data(data, le_pitch, le_duration, le_hand, le_fingering, wo
     df = df.dropna(subset=['fingering'])
     df['fingering'] = df['fingering'].astype(int)
 
-    # 计算 MIDI 编号
-    df['midi_number'] = df['note'].apply(get_midi_number)
+    # 标准化 'note' 列
+    df['normalized_spelled_pitch'] = df['note'].apply(normalize_spelled_pitch)
 
-    # 对类别特征进行标签编码
-    df['pitch_encoded'] = le_pitch.transform(df['note'])
+    # 计算 MIDI 编号，使用标准化后的音符
+    df['midi_number'] = df['normalized_spelled_pitch'].apply(get_midi_number)
+
+    # 对类别特征进行标签编码，使用标准化后的音符
+    df['pitch_encoded'] = le_pitch.transform(df['normalized_spelled_pitch'])
     df['duration_encoded'] = le_duration.transform(df['duration'].astype(str))
     df['hand_encoded'] = le_hand.transform(df['hand'])
 

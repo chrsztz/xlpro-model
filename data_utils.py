@@ -1,5 +1,4 @@
 # data_utils.py
-
 import re
 import numpy as np
 import pandas as pd
@@ -7,12 +6,59 @@ import pickle
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from gensim.models import Word2Vec
 
+# 1. 增强音符映射字典
+ENHARMONIC_MAPPING = {
+    'C#': 'C#',
+    'Db': 'C#',
+    'D#': 'D#',
+    'Eb': 'D#',
+    'F#': 'F#',
+    'Gb': 'F#',
+    'G#': 'G#',
+    'Ab': 'G#',
+    'A#': 'A#',
+    'Bb': 'A#',
+    'C': 'C',
+    'D': 'D',
+    'E': 'E',
+    'F': 'F',
+    'G': 'G',
+    'A': 'A',
+    'B': 'B'
+}
+
+# 创建反向映射，用于还原
+REVERSE_ENHARMONIC_MAPPING = {}
+for key, value in ENHARMONIC_MAPPING.items():
+    if value not in REVERSE_ENHARMONIC_MAPPING:
+        REVERSE_ENHARMONIC_MAPPING[value] = []
+    REVERSE_ENHARMONIC_MAPPING[value].append(key)
+
+def normalize_spelled_pitch(spelled_pitch):
+    """
+    将同音异名的音符标准化为统一的表示（例如，将所有降音符转换为升音符）。
+    """
+    # 分离音名和八度
+    pitch_name = ''.join([c for c in spelled_pitch if c.isalpha() or c in ['#', 'b']])
+    octave = ''.join([c for c in spelled_pitch if c.isdigit()])
+    normalized_pitch = ENHARMONIC_MAPPING.get(pitch_name, pitch_name)  # 默认不变
+    return f"{normalized_pitch}{octave}"
+
+def denormalize_spelled_pitch(normalized_pitch):
+    """
+    根据需要将标准化后的音符还原为原始的同音异名形式。
+    """
+    # 简单选择映射中的第一个同音异名，如果需要特定的还原逻辑，可以进一步扩展
+    pitch_name = ''.join([c for c in normalized_pitch if c.isalpha() or c in ['#', 'b']])
+    octave = ''.join([c for c in normalized_pitch if c.isdigit()])
+    original_pitch = REVERSE_ENHARMONIC_MAPPING.get(pitch_name, [pitch_name])[0]  # 默认选第一个
+    return f"{original_pitch}{octave}"
 
 def get_midi_number(spelled_pitch):
     """
-    将拼写音高（如 C4, D#5）转换为 MIDI 编号。
-    A4 ≈ 440Hz 对应 MIDI 69。
+    将标准化后的 spelled_pitch 转换为 MIDI 编号。
     """
+    # 解析音名和八度
     match = re.match(r'^([A-Ga-g][#b]?)(\d+)$', spelled_pitch)
     if not match:
         return 60  # 默认C4
@@ -29,14 +75,12 @@ def get_midi_number(spelled_pitch):
     midi_number = 12 * (octave + 1) + semitone
     return midi_number
 
-
 def is_black_key(midi_number):
     """
     判断MIDI编号对应的音符是否为黑键。
     """
     black_keys = {1, 3, 6, 8, 10}  # C#:1, D#:3, F#:6, G#:8, A#:10
     return 1 if (midi_number % 12) in black_keys else 0
-
 
 def calculate_speed_features(df, window=1.0):
     df = df.copy()
@@ -56,7 +100,6 @@ def calculate_speed_features(df, window=1.0):
 
     df['note_density'] = calculate_density(df, window)
     return df
-
 
 def calculate_midi_diff(df):
     """
@@ -82,14 +125,12 @@ def calculate_midi_diff(df):
     df['midi_diff_processed'] = df.apply(process_midi_diff, axis=1)
     return df
 
-
 def create_word_column(df, feature_columns):
     """
     创建 'word' 列，将多个特征组合成一个字符串，用于Word2Vec训练。
     """
     df['word'] = df.apply(lambda row: '_'.join(map(str, row[feature_columns].values)), axis=1)
     return df
-
 
 def train_word2vec(sentences, window=2, vector_size=128, min_count=1, workers=4):
     """
@@ -98,7 +139,6 @@ def train_word2vec(sentences, window=2, vector_size=128, min_count=1, workers=4)
     model = Word2Vec(sentences, window=window, vector_size=vector_size, min_count=min_count, workers=workers, sg=0)
     return model
 
-
 def get_fused_features(df, word2vec_model):
     """
     使用 Word2Vec 模型将每个音符的特征向量转化为融合特征向量。
@@ -106,7 +146,6 @@ def get_fused_features(df, word2vec_model):
     df['fused_feature'] = df['word'].apply(
         lambda x: word2vec_model.wv[x] if x in word2vec_model.wv else np.zeros(word2vec_model.vector_size))
     return df
-
 
 def combine_features(df, feature_columns):
     """
@@ -119,14 +158,12 @@ def combine_features(df, feature_columns):
     df['combined_features'] = df.apply(combine, axis=1)
     return df
 
-
 def save_pickle(obj, filename):
     """
     保存对象为pickle文件。
     """
     with open(filename, 'wb') as f:
         pickle.dump(obj, f)
-
 
 def load_pickle(filename):
     """

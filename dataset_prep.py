@@ -9,8 +9,12 @@ from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE
 from data_utils import (
     get_midi_number,
-    save_pickle
+    save_pickle,
+    normalize_spelled_pitch,        # 导入标准化函数
+    ENHARMONIC_MAPPING,             # 导入映射字典
+    REVERSE_ENHARMONIC_MAPPING      # 导入反向映射字典
 )
+
 def parse_fingering_file(file_path):
     """
     解析单个 fingering 文件，返回包含所有音符信息的列表。
@@ -52,11 +56,15 @@ def parse_fingering_file(file_path):
             # 计算音符持续时间
             duration = offset_time - onset_time
 
+            # 标准化 spelled_pitch
+            normalized_spelled_pitch = normalize_spelled_pitch(spelled_pitch)
+
             data.append({
                 'note_id': note_id,
                 'onset_time': onset_time,
                 'offset_time': offset_time,
                 'spelled_pitch': spelled_pitch,
+                'normalized_spelled_pitch': normalized_spelled_pitch,  # 添加标准化后的音符
                 'pitch_name': pitch_name,
                 'octave': octave,
                 'duration': duration,
@@ -95,8 +103,8 @@ def main():
     # 确保指法为整数类型
     df['finger_number'] = df['finger_number'].astype(int)
 
-    # 计算 MIDI 编号
-    df['midi_number'] = df['spelled_pitch'].apply(get_midi_number)
+    # 计算 MIDI 编号，使用标准化后的音符
+    df['midi_number'] = df['normalized_spelled_pitch'].apply(get_midi_number)
 
     # 初始化 LabelEncoder
     le_pitch = LabelEncoder()
@@ -104,8 +112,8 @@ def main():
     le_hand = LabelEncoder()
     le_fingering = LabelEncoder()
 
-    # 对类别特征进行标签编码
-    df['pitch_encoded'] = le_pitch.fit_transform(df['spelled_pitch'])
+    # 对类别特征进行标签编码，使用标准化后的音符
+    df['pitch_encoded'] = le_pitch.fit_transform(df['normalized_spelled_pitch'])
     df['duration_encoded'] = le_duration.fit_transform(df['duration'].astype(str))
     df['hand_encoded'] = le_hand.fit_transform(df['hand'])
 
@@ -119,12 +127,15 @@ def main():
     print(f"特征形状: {X.shape}")
     print(f"标签形状: {y.shape}")
 
-    # 保存 LabelEncoder
+    # 保存 LabelEncoder 和映射
     save_pickle(le_pitch, 'le_pitch.pkl')
     save_pickle(le_duration, 'le_duration.pkl')
     save_pickle(le_hand, 'le_hand.pkl')
     save_pickle(le_fingering, 'le_fingering.pkl')
     save_pickle(df, "df.pkl")
+    # 保存标准化映射
+    save_pickle(ENHARMONIC_MAPPING, 'enharmonic_mapping.pkl')
+    save_pickle(REVERSE_ENHARMONIC_MAPPING, 'reverse_enharmonic_mapping.pkl')
 
     # 创建序列
     sequence_length = 10  # 使用前10个音符预测第11个音符
