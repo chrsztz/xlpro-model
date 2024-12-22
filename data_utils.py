@@ -6,25 +6,51 @@ import pickle
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from gensim.models import Word2Vec
 
-# 1. 增强音符映射字典
 ENHARMONIC_MAPPING = {
-    'C#': 'C#',
+    # 双降音符
+    'Cbb': 'Bb',
+    'Dbb': 'C',
+    'Ebb': 'D',
+    'Fbb': 'Eb',
+    'Gbb': 'F',
+    'Abb': 'G',
+    'Bbb': 'A',
+
+    # 单降音符
+    'Cb': 'B',
     'Db': 'C#',
-    'D#': 'D#',
     'Eb': 'D#',
-    'F#': 'F#',
+    'Fb': 'E',
     'Gb': 'F#',
-    'G#': 'G#',
     'Ab': 'G#',
-    'A#': 'A#',
     'Bb': 'A#',
+
+    # 纯音符
     'C': 'C',
     'D': 'D',
     'E': 'E',
     'F': 'F',
     'G': 'G',
     'A': 'A',
-    'B': 'B'
+    'B': 'B',
+
+    # 单升音符
+    'C#': 'C#',
+    'D#': 'D#',
+    'E#': 'F',
+    'F#': 'F#',
+    'G#': 'G#',
+    'A#': 'A#',
+    'B#': 'C',
+
+    # 双升音符
+    'Cx': 'D',
+    'Dx': 'E',
+    'Ex': 'F#',
+    'Fx': 'G',
+    'Gx': 'A',
+    'Ax': 'B',
+    'Bx': 'C#',
 }
 
 # 创建反向映射，用于还原
@@ -139,12 +165,45 @@ def train_word2vec(sentences, window=2, vector_size=128, min_count=1, workers=4)
     model = Word2Vec(sentences, window=window, vector_size=vector_size, min_count=min_count, workers=workers, sg=0)
     return model
 
+
 def get_fused_features(df, word2vec_model):
     """
     使用 Word2Vec 模型将每个音符的特征向量转化为融合特征向量。
+    添加错误检查和日志。
     """
-    df['fused_feature'] = df['word'].apply(
-        lambda x: word2vec_model.wv[x] if x in word2vec_model.wv else np.zeros(word2vec_model.vector_size))
+
+    def get_vector(word):
+        try:
+            if word in word2vec_model.wv:
+                return word2vec_model.wv[word]
+            else:
+                print(f"Warning: Word not in vocabulary: {word}")
+                return np.zeros(word2vec_model.vector_size)
+        except Exception as e:
+            print(f"Error getting vector for word '{word}': {str(e)}")
+            return np.zeros(word2vec_model.vector_size)
+
+    # 检查word列是否存在
+    if 'word' not in df.columns:
+        raise KeyError("Column 'word' not found in DataFrame")
+
+    # 打印一些word列的样本，帮助调试
+    print("Sample words:", df['word'].head().tolist())
+
+    # 检查Word2Vec模型
+    print(f"Word2Vec vocabulary size: {len(word2vec_model.wv.key_to_index)}")
+    print(f"Word2Vec vector size: {word2vec_model.vector_size}")
+
+    # 获取特征向量并添加错误检查
+    features = []
+    for word in df['word']:
+        vector = get_vector(word)
+        features.append(vector)
+
+    if not features:
+        raise ValueError("No features were generated")
+
+    df['fused_feature'] = features
     return df
 
 def combine_features(df, feature_columns):

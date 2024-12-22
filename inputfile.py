@@ -36,13 +36,39 @@ def get_hand(part):
     print(f"Assigning part '{part.partName}' (ID: {part.id}) to {hand} hand based on pitch range.")
     return hand
 
-def preprocess_input_data(data, le_pitch, le_duration, le_hand, le_fingering, word2vec_model, scaler, sequence_length=10, window=1.0):
+
+def preprocess_input_data(data, le_pitch, le_duration, le_hand, le_fingering, word2vec_model, scaler,
+                          sequence_length=10, window=1.0):
     """
     将音符数据转换为模型输入格式。
     """
     df = pd.DataFrame(data)
+    # 在这里添加调试信息
+    print("Initial DataFrame shape:", df.shape)
+    print("Initial data sample:")
+    print(df.head())
+
+    # 修改 dropna 的处理方式
     df = df.dropna(subset=['fingering'])
-    df['fingering'] = df['fingering'].astype(int)
+    # 添加 dropna 后的调试信息
+    print("Shape after dropna:", df.shape)
+    df['fingering'] = df['fingering'].fillna(-1)
+
+    # 直接在df中添加时间特征，避免创建新的DataFrame
+    current_time = 0
+    onset_times = []
+    offset_times = []
+
+    # 按顺序处理每个音符的时间
+    for idx in df.index:
+        duration = float(df.at[idx, 'duration'])
+        onset_times.append(current_time)
+        offset_times.append(current_time + duration)
+        current_time = current_time + duration
+
+    # 直接添加到原DataFrame
+    df['onset_time'] = onset_times
+    df['offset_time'] = offset_times
 
     # 标准化 'note' 列
     df['normalized_spelled_pitch'] = df['note'].apply(normalize_spelled_pitch)
@@ -50,7 +76,7 @@ def preprocess_input_data(data, le_pitch, le_duration, le_hand, le_fingering, wo
     # 计算 MIDI 编号，使用标准化后的音符
     df['midi_number'] = df['normalized_spelled_pitch'].apply(get_midi_number)
 
-    # 对类别特征进行标签编码，使用标准化后的音符
+    # 对类别特征进行标签编码
     df['pitch_encoded'] = le_pitch.transform(df['normalized_spelled_pitch'])
     df['duration_encoded'] = le_duration.transform(df['duration'].astype(str))
     df['hand_encoded'] = le_hand.transform(df['hand'])
@@ -76,15 +102,36 @@ def preprocess_input_data(data, le_pitch, le_duration, le_hand, le_fingering, wo
         'midi_diff_processed', 'real_duration',
         'note_density', 'black_key', 'chord'
     ]
+
+    # 在获取融合特征之前添加调试信息
+    print("Feature columns:", feature_columns)
+    print("DataFrame shape:", df.shape)
+    print("Sample of data before word creation:")
+    print(df[feature_columns].head())
+
+    # 创建 word 列
     df = create_word_column(df, feature_columns)
+    print("\nSample words after creation:")
+    print(df['word'].head())
 
     # 获取融合特征
-    df = get_fused_features(df, word2vec_model)
+    try:
+        df = get_fused_features(df, word2vec_model)
 
-    # 标准化融合特征
-    fused_features = np.vstack(df['fused_feature'].values)
-    fused_features_scaled = scaler.transform(fused_features)
-    df['fused_feature_scaled'] = list(fused_features_scaled)
+        # 验证融合特征是否成功生成
+        if df['fused_feature'].empty or len(df['fused_feature']) == 0:
+            raise ValueError("No fused features were generated")
+
+        # 检查融合特征的维度
+        print(f"\nFused feature sample shape: {len(df['fused_feature'].iloc[0])}")
+        print(f"Number of fused features: {len(df['fused_feature'])}")
+
+        fused_features = np.vstack(df['fused_feature'].values)
+        fused_features_scaled = scaler.transform(fused_features)
+        df['fused_feature_scaled'] = list(fused_features_scaled)
+    except Exception as e:
+        print(f"Error in feature fusion process: {str(e)}")
+        raise
 
     # 将融合特征与原始特征组合
     df = combine_features(df, feature_columns)
@@ -96,15 +143,15 @@ def preprocess_input_data(data, le_pitch, le_duration, le_hand, le_fingering, wo
     X_seq = []
     y_seq = []
     for i in range(len(X) - sequence_length):
-        X_seq.append(X[i:i+sequence_length])
-        y_seq.append(y[i+sequence_length])
+        X_seq.append(X[i:i + sequence_length])
+        y_seq.append(y[i + sequence_length])
     X_seq = np.array(X_seq)
     y_seq = np.array(y_seq)
 
     return X_seq, y_seq
 
 def main():
-    score_path = 'example.mxl'  # 替换为您的文件路径
+    score_path = 'Fr_Elise.mxl'  # 替换为您的文件路径
     score = converter.parse(score_path)
 
     key_sig = score.analyze('key')
@@ -185,9 +232,11 @@ def main():
                 data.append({
                     'note': note_name,
                     'octave': octave,
-                    'duration': element.quarterLength,
+                    'duration': float(element.quarterLength),
                     'hand': hand,
-                    'fingering': fingering
+                    'fingering': fingering if fingering is not None else -1,
+                    'is_chord': 0,  # 添加和弦标识
+                    'chord': 0  # 保持与训练端一致
                 })
 
                 previous_note = element
@@ -223,9 +272,11 @@ def main():
                     data.append({
                         'note': note_name,
                         'octave': octave,
-                        'duration': n.quarterLength,
+                        'duration': float(n.quarterLength),
                         'hand': hand,
-                        'fingering': fingering
+                        'fingering': fingering if fingering is not None else -1,
+                        'is_chord': 1,  # 添加和弦标识
+                        'chord': 1  # 保持与训练端一致
                     })
 
                 chord_str = f"{key_str} " + " ".join(chord_notes)
