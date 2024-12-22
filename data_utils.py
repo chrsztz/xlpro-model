@@ -52,6 +52,22 @@ ENHARMONIC_MAPPING = {
     'Ax': 'B',
     'Bx': 'C#',
 }
+TEMPO_MAPPING = {
+    'Larghissimo': 24,
+    'Grave': 40,
+    'Largo': 40,
+    'Larghetto': 50,
+    'Adagio': 66,
+    'Adagietto': 68,
+    'Andante': 76,
+    'Andantino': 80,
+    'Moderato': 108,
+    'Allegretto': 112,
+    'Allegro': 120,
+    'Vivace': 156,
+    'Presto': 168,
+    'Prestissimo': 200
+}
 
 # 创建反向映射，用于还原
 REVERSE_ENHARMONIC_MAPPING = {}
@@ -155,7 +171,7 @@ def create_word_column(df, feature_columns):
     """
     创建 'word' 列，将多个特征组合成一个字符串，用于Word2Vec训练。
     """
-    df['word'] = df.apply(lambda row: '_'.join(map(str, row[feature_columns].values)), axis=1)
+    df['word'] = df[feature_columns].astype(str).agg(' '.join, axis=1)
     return df
 
 def train_word2vec(sentences, window=2, vector_size=128, min_count=1, workers=4):
@@ -166,45 +182,28 @@ def train_word2vec(sentences, window=2, vector_size=128, min_count=1, workers=4)
     return model
 
 
-def get_fused_features(df, word2vec_model):
-    """
-    使用 Word2Vec 模型将每个音符的特征向量转化为融合特征向量。
-    添加错误检查和日志。
-    """
+# data_utils.py
 
-    def get_vector(word):
-        try:
-            if word in word2vec_model.wv:
-                return word2vec_model.wv[word]
+def get_fused_features(df, word2vec_model, tokenized_sentences):
+    """
+    获取融合特征，通过 Word2Vec 将 'word' 列转换为向量。
+    处理未在词汇表中的单词，使用全零向量。
+    """
+    def get_vector(tokens):
+        vectors = []
+        for token in tokens:
+            if token in word2vec_model.wv:
+                vectors.append(word2vec_model.wv[token])
             else:
-                print(f"Warning: Word not in vocabulary: {word}")
-                return np.zeros(word2vec_model.vector_size)
-        except Exception as e:
-            print(f"Error getting vector for word '{word}': {str(e)}")
+                vectors.append(np.zeros(word2vec_model.vector_size))
+        if vectors:
+            return np.mean(vectors, axis=0)  # 使用平均向量作为融合特征
+        else:
             return np.zeros(word2vec_model.vector_size)
 
-    # 检查word列是否存在
-    if 'word' not in df.columns:
-        raise KeyError("Column 'word' not found in DataFrame")
-
-    # 打印一些word列的样本，帮助调试
-    print("Sample words:", df['word'].head().tolist())
-
-    # 检查Word2Vec模型
-    print(f"Word2Vec vocabulary size: {len(word2vec_model.wv.key_to_index)}")
-    print(f"Word2Vec vector size: {word2vec_model.vector_size}")
-
-    # 获取特征向量并添加错误检查
-    features = []
-    for word in df['word']:
-        vector = get_vector(word)
-        features.append(vector)
-
-    if not features:
-        raise ValueError("No features were generated")
-
-    df['fused_feature'] = features
+    df['fused_feature'] = tokenized_sentences.apply(get_vector)
     return df
+
 
 def combine_features(df, feature_columns):
     """

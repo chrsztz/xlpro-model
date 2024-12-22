@@ -45,9 +45,6 @@ def main():
         return
 
     # 加载 DataFrame
-    # 假设在 `dataset_prep.py` 中保存了完整的 DataFrame
-    # 如果未保存，请在 `dataset_prep.py` 中添加保存 DataFrame 的步骤
-    # 例如：df.to_pickle('df.pkl')
     try:
         df = pd.read_pickle('df.pkl')
         print(type(df))
@@ -74,8 +71,13 @@ def main():
     print("部分 'word' 列样例：")
     print(df['word'].head())
 
+    # **修改部分开始**
+    # 将 'word' 列拆分为单词列表
+    tokenized_sentences = df['word'].apply(lambda x: x.split()).tolist()
+
     # 训练 Word2Vec-CBOW 模型
-    word2vec_model = train_word2vec(df['word'].tolist(), window=2, vector_size=128, min_count=1, workers=4)
+    word2vec_model = train_word2vec(tokenized_sentences, window=2, vector_size=128, min_count=1, workers=4)
+    # **修改部分结束**
 
     # 保存模型
     word2vec_model.save("word2vec_cbow.model")

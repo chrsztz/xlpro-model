@@ -67,7 +67,7 @@ def main():
 
     # 参数设置
     input_size = X_train_aug.shape[2]  # 特征数量
-    hidden_size = 256
+    hidden_size = 512
     num_layers = 3
     num_classes = len(le_fingering.classes_)
     dropout = 0.5
