@@ -181,6 +181,7 @@ def main():
     # 保存结果
     modified_score.write('mxl', fp=output_path)
     print(f"Fingering prediction completed. Modified score saved to {output_path}")
+    pass
 
 
 if __name__ == "__main__":
