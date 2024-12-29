@@ -81,19 +81,58 @@ class Attention(nn.Module):
         return context
 
 # BiLSTM 与 Attention 结合的模型
-class BiLSTMWithAttention(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout=0.5):
-        super(BiLSTMWithAttention, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
+import torch.nn as nn
+import torch
 
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True, bidirectional=True, dropout=dropout)
-        self.attention = Attention(hidden_size)
-        self.fc = nn.Linear(hidden_size * 2, num_classes)  # 双向 LSTM
+class BiLSTMWithAttention(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout, bidirectional=True):
+        super(BiLSTMWithAttention, self).__init__()
+        
+        # LSTM Layer
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=bidirectional,
+            batch_first=True
+        )
+        
+        # Attention Layer
+        lstm_output_size = hidden_size * 2 if bidirectional else hidden_size
+        self.attention = AttentionMechanism(lstm_output_size)
+        
+        # Fully Connected Layer
+        self.fc = nn.Linear(lstm_output_size, num_classes)
 
     def forward(self, x):
-        lstm_out, _ = self.lstm(x)  # [batch_size, seq_length, hidden_size*2]
-        context = self.attention(lstm_out[:, -1, :], lstm_out)  # [batch_size, hidden_size*2]
-        out = self.fc(context)  # [batch_size, num_classes]
-        return out
+        lstm_out, _ = self.lstm(x)
+        # print(f"LSTM Output Shape: {lstm_out.shape}")
+        context_vector, attn_weights = self.attention(lstm_out)
+        # print(f"Context Vector Shape: {context_vector.shape}")
+        output = self.fc(context_vector)
+        return output
+
+
+
+class AttentionMechanism(nn.Module):
+    def __init__(self, lstm_output_size):
+        super(AttentionMechanism, self).__init__()
+        self.attn = nn.Linear(lstm_output_size, lstm_output_size, bias=True)
+        self.v = nn.Parameter(torch.randn(lstm_output_size))
+
+    def forward(self, lstm_out):
+        # lstm_out: [batch_size, seq_len, lstm_output_size]
+        
+        # Compute attention scores
+        attn_scores = torch.tanh(self.attn(lstm_out))  # [batch_size, seq_len, lstm_output_size]
+        attn_scores = torch.matmul(attn_scores, self.v)  # [batch_size, seq_len]
+
+        # Normalize attention scores to probabilities
+        attn_weights = torch.softmax(attn_scores, dim=1)  # [batch_size, seq_len]
+
+        # Compute the context vector
+        context_vector = torch.sum(attn_weights.unsqueeze(-1) * lstm_out, dim=1)  # [batch_size, lstm_output_size]
+        
+        return context_vector, attn_weights
+

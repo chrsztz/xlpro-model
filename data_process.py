@@ -70,11 +70,10 @@ def main():
 
     print("部分 'word' 列样例：")
     print(df['word'].head())
-
+    save_pickle(df, "df.pkl")
     # **修改部分开始**
     # 将 'word' 列拆分为单词列表
     tokenized_sentences = df['word'].apply(lambda x: x.split()).tolist()
-
     # 训练 Word2Vec-CBOW 模型
     word2vec_model = train_word2vec(tokenized_sentences, window=2, vector_size=128, min_count=1, workers=4)
     # **修改部分结束**
@@ -85,7 +84,7 @@ def main():
     print("Word2Vec 模型已训练并保存。")
 
     # 获取融合特征
-    df = get_fused_features(df, word2vec_model)
+    df = get_fused_features(df, word2vec_model, tokenized_sentences)
 
     # 将融合特征向量转化为多维特征
     fused_features = np.vstack(df['fused_feature'].values)

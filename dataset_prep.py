@@ -14,13 +14,59 @@ from data_utils import (
     save_pickle,
     normalize_spelled_pitch,        # 导入标准化函数
     ENHARMONIC_MAPPING,             # 导入映射字典
-    REVERSE_ENHARMONIC_MAPPING      # 导入反向映射字典
+    REVERSE_ENHARMONIC_MAPPING,     # 导入反向映射字典
+    CustomFingeringEncoder
 )
+
+
+def mark_chords(df):
+    """
+    标记 'chord' 列为 1 如果同一曲目 (piece_id) 同一手部 (hand) 内有多个音符的时间区间重叠。
+    否则，标记为 0。
+    """
+    df['chord'] = 0  # 初始化为 0
+
+    # 按 'piece_id' 和 'hand' 分组
+    grouped = df.groupby(['piece_id', 'hand'])
+
+    def mark_chords_group(group):
+        """
+        对每个分组（同一曲目同一手部）标记和弦。
+        """
+        group = group.sort_values('onset_time').reset_index(drop=True)
+        n = len(group)
+        chord_indices = set()
+
+        for i in range(n):
+            current_onset = group.loc[i, 'onset_time']
+            current_offset = group.loc[i, 'offset_time']
+
+            for j in range(i + 1, n):
+                next_onset = group.loc[j, 'onset_time']
+                next_offset = group.loc[j, 'offset_time']
+
+                if next_onset < current_offset:  # 重叠
+                    chord_indices.add(i)
+                    chord_indices.add(j)
+                else:
+                    break  # 因为已排序，后续不会再重叠
+
+        # 将重叠的音符标记为和弦
+        if chord_indices:
+            group.loc[list(chord_indices), 'chord'] = 1
+
+        return group
+
+    # 应用到每个分组
+    df = grouped.apply(mark_chords_group).reset_index(drop=True)
+
+    return df
 
 def parse_fingering_file(file_path):
     """
     解析单个 fingering 文件，返回包含所有音符信息的列表。
     """
+    piece_id = os.path.splitext(os.path.basename(file_path))[0]  # 使用文件名（不含扩展名）作为 piece_id
     data = []
     with open(file_path, 'r') as f:
         for line in f:
@@ -66,6 +112,7 @@ def parse_fingering_file(file_path):
             offset_time = round(offset_time, 3)
 
             data.append({
+                'piece_id': piece_id,  # 添加 piece_id
                 'note_id': note_id,
                 'onset_time': onset_time,
                 'offset_time': offset_time,
@@ -134,15 +181,25 @@ def main():
     le_pitch = LabelEncoder()
     le_duration = LabelEncoder()
     le_hand = LabelEncoder()
-    le_fingering = LabelEncoder()
 
     # 对类别特征进行标签编码，使用标准化后的音符
     df['pitch_encoded'] = le_pitch.fit_transform(df['normalized_spelled_pitch'])
     df['duration_encoded'] = le_duration.fit_transform(df['duration'].astype(str))
     df['hand_encoded'] = le_hand.fit_transform(df['hand'])
 
-    # 对目标标签进行标签编码
-    df['fingering_encoded'] = le_fingering.fit_transform(df['finger_number'])
+    fingering_encoder = CustomFingeringEncoder()
+    print("Original finger numbers:", np.unique(df['finger_number']))
+
+    # 确保所有指法都是合法的
+    fingering_encoder.fit(df['finger_number'])
+    df['fingering_encoded'] = fingering_encoder.transform(df['finger_number'])
+
+    print("Encoded finger numbers:", np.unique(df['fingering_encoded']))
+    print("\nFingering mapping:")
+    for orig, encoded in fingering_encoder.mapping.items():
+        print(f"{orig} -> {encoded}")
+
+    df = mark_chords(df)
 
     # 特征和标签
     X = df[['pitch_encoded', 'duration_encoded', 'hand_encoded']].values
@@ -150,12 +207,11 @@ def main():
 
     print(f"特征形状: {X.shape}")
     print(f"标签形状: {y.shape}")
-
     # 保存 LabelEncoder 和映射
     save_pickle(le_pitch, 'le_pitch.pkl')
     save_pickle(le_duration, 'le_duration.pkl')
     save_pickle(le_hand, 'le_hand.pkl')
-    save_pickle(le_fingering, 'le_fingering.pkl')
+    save_pickle(fingering_encoder, 'le_fingering.pkl')
     save_pickle(df, "df.pkl")
     # 保存标准化映射
     save_pickle(ENHARMONIC_MAPPING, 'enharmonic_mapping.pkl')

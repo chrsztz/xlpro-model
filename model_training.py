@@ -8,7 +8,7 @@ import pickle
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.utils.class_weight import compute_class_weight
-
+from tqdm import tqdm 
 from data_utils import load_pickle
 from models import TransformerModel,BiGRU,BiLSTM,BiLSTMWithAttention
 
@@ -67,9 +67,10 @@ def main():
 
     # 参数设置
     input_size = X_train_aug.shape[2]  # 特征数量
+    print(input_size)
     hidden_size = 512
     num_layers = 3
-    num_classes = len(le_fingering.classes_)
+    num_classes = 10
     dropout = 0.5
 
     # 初始化模型
@@ -110,7 +111,7 @@ def main():
 
     num_epochs = 100
     best_val_loss = float('inf')
-    patience = 10
+    patience = 5
     trigger_times = 0
     best_model_state = None
 
@@ -119,7 +120,8 @@ def main():
         model.train()
         train_loss = 0
 
-        for X_batch, y_batch in train_loader:
+        for X_batch, y_batch in tqdm(train_loader, desc="Training", leave=False):
+            # print(f"Processing batch size: {X_batch.size(0)}")
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
 
@@ -140,7 +142,7 @@ def main():
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
+            for X_batch, y_batch in tqdm(val_loader, desc="Validation", leave=False):
                 X_batch = X_batch.to(device)
                 y_batch = y_batch.to(device)
 

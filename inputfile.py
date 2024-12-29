@@ -118,6 +118,42 @@ def calculate_actual_duration(element, bpm):
     actual_duration = element.duration.quarterLength * beat_duration
     return round(actual_duration,2)
 
+from sklearn.preprocessing import LabelEncoder
+
+def replace_unseen_labels(df, column, le_pitch):
+    """
+    Replace unseen pitch labels in the dataset with the closest known label.
+
+    Args:
+    - df: DataFrame containing the pitch column.
+    - column: Name of the column to process (e.g., 'normalized_spelled_pitch').
+    - le_pitch: Trained LabelEncoder instance.
+
+    Returns:
+    - DataFrame with replaced labels.
+    """
+    known_classes = set(le_pitch.classes_)
+
+    def find_closest_label(label):
+        """
+        Find the closest label to the unseen one based on pitch similarity.
+        """
+        if label in known_classes:
+            return label
+        # Extract pitch components (e.g., 'B7' -> 'B', '7')
+        pitch_name, octave = label[:-1], label[-1]
+        # Suggest replacement pitches within the same octave or neighboring ones
+        replacements = [cls for cls in known_classes if cls[:-1] == pitch_name]
+        if replacements:
+            # Prefer the same pitch name
+            return replacements[0]
+        else:
+            # Fall back to a known pitch (e.g., closest alphabetically)
+            return min(known_classes, key=lambda x: abs(int(x[-1]) - int(octave)))
+
+    # Replace unseen labels
+    df[column] = df[column].apply(find_closest_label)
+    return df
 
 # inputfile.py
 
@@ -146,7 +182,13 @@ def preprocess_input_data(data, le_pitch, le_duration, le_hand, le_fingering, wo
     df['midi_number'] = df['normalized_spelled_pitch'].apply(get_midi_number)
 
     # 对类别特征进行标签编码
-    df['pitch_encoded'] = le_pitch.transform(df['normalized_spelled_pitch'])
+    #df['pitch_encoded'] = le_pitch.transform(df['normalized_spelled_pitch'])
+    try:
+        df['pitch_encoded'] = le_pitch.transform(df['normalized_spelled_pitch'])
+    except ValueError as e:
+        print(f"Unseen labels detected: {e}")
+        df = replace_unseen_labels(df, 'normalized_spelled_pitch', le_pitch)
+        df['pitch_encoded'] = le_pitch.transform(df['normalized_spelled_pitch'])
     df['duration_encoded'] = le_duration.transform(df['duration'].astype(str))
     df['hand_encoded'] = le_hand.transform(df['hand'])
 
@@ -210,8 +252,33 @@ def preprocess_input_data(data, le_pitch, le_duration, le_hand, le_fingering, wo
         print(f"Number of fused features: {len(df['fused_feature'])}")
 
         fused_features = np.vstack(df['fused_feature'].values)
+        scaler.fit(fused_features)
+        # Check for missing features in the fused_features before scaling
+        #expected_features = scaler.feature_names_in_  # Expected features from the scaler
+        # Ensure expected feature alignment with the scaler
+        try:
+            expected_feature_count = scaler.mean_.shape[0]  # Number of features the scaler expects
+            current_feature_count = fused_features.shape[1]
+
+            if current_feature_count < expected_feature_count:
+                # Calculate missing features
+                missing_features_count = expected_feature_count - current_feature_count
+                print(f"Adding {missing_features_count} missing features.")
+                # Append columns of zeros for the missing features
+                missing_features = np.zeros((fused_features.shape[0], missing_features_count))
+                fused_features = np.hstack((fused_features, missing_features))
+            elif current_feature_count > expected_feature_count:
+                print(f"Trimming {current_feature_count - expected_feature_count} excess features.")
+                # Trim excess features if there are extra columns
+                fused_features = fused_features[:, :expected_feature_count]
+        except Exception as e:
+            print(f"Error while aligning features: {e}")
+            raise
+
+        # Scale the features
         fused_features_scaled = scaler.transform(fused_features)
         df['fused_feature_scaled'] = list(fused_features_scaled)
+
     except Exception as e:
         print(f"Error in feature fusion process: {str(e)}")
         raise
@@ -225,17 +292,33 @@ def preprocess_input_data(data, le_pitch, le_duration, le_hand, le_fingering, wo
     # 创建序列
     X_seq = []
     y_seq = []
-    for i in range(len(X) - sequence_length):
+    for i in range(len(X) - sequence_length + 1):  # Include the last valid sequence
         X_seq.append(X[i:i + sequence_length])
-        y_seq.append(y[i + sequence_length])
-    X_seq = np.array(X_seq)
+        y_seq.append(y[i + sequence_length - 1])  # Use the last value of the sequence as the target
+
+    try:
+        X_seq = np.array(X_seq, dtype=np.float32)
+    except ValueError as e:
+        print(f"Error converting X_seq to float32: {e}")
+        print(f"Sample problematic data: {X_seq[:5]}")
+        exit(1)
+
+    # Check shape and dtype of X_seq
+    print(f"X_seq shape: {X_seq.shape}, dtype: {X_seq.dtype}")
     y_seq = np.array(y_seq)
 
     return X_seq, y_seq
 
+def get_word_embedding(word, word2vec_model):
+    try:
+        return word2vec_model.wv[word]
+    except KeyError:
+        return np.zeros(word2vec_model.vector_size)  # Default embedding for unknown words
+    
 
+    
 def main():
-    score_path = 'Fr_Elise.mxl'  # 替换为您的文件路径
+    score_path = './output/001_Bach_Invention_No1_C.mxl'  # 替换为您的文件路径
     score = converter.parse(score_path)
 
     # 提取 Tempo 信息
@@ -329,7 +412,6 @@ def main():
                     'duration': actual_duration,  # 使用实际时长
                     'hand': hand,
                     'fingering': fingering if fingering is not None else -1,
-                    'is_chord': 0,
                     'chord': 0,
                     'onset_time': round(onset_time, 3),
                     'offset_time': round(offset_time, 3)
@@ -360,7 +442,6 @@ def main():
                     'duration': actual_duration,
                     'hand': hand,
                     'fingering': fingering if fingering is not None else -1,
-                    'is_chord': 0,
                     'chord': 0,
                     'onset_time': round(onset_time, 3),
                     'offset_time': round(offset_time, 3)
@@ -387,7 +468,6 @@ def main():
                         'duration': actual_duration,  # 使用实际时长
                         'hand': hand,
                         'fingering': fingering if fingering is not None else -1,
-                        'is_chord': 1,
                         'chord': 1,
                         'onset_time': round(onset_time, 3),
                         'offset_time': round(offset_time, 3)
@@ -432,7 +512,6 @@ def main():
                     'duration': actual_duration,  # 使用实际时长
                     'hand': hand,
                     'fingering': -1,  # 休止符没有指法
-                    'is_chord': 0,
                     'chord': 0,
                     'onset_time': round(onset_time, 3),
                     'offset_time': round(offset_time, 3)
@@ -503,7 +582,16 @@ def main():
 
         # 加载模型
         try:
-            model = BiLSTMWithAttention(input_size=X_seq.shape[2], hidden_size=256, num_layers=3, num_classes=len(le_fingering.classes_), dropout=0.5)
+            #model = BiLSTMWithAttention(input_size=X_seq.shape[2], hidden_size=256, num_layers=3, num_classes=len(le_fingering.classes_), dropout=0.5)
+            model = BiLSTMWithAttention(
+            input_size=136,      # Matches `X_seq.shape[2]`
+            hidden_size=512,     # Matches checkpoint's hidden size
+            num_layers=3,        # Matches the number of LSTM layers
+            num_classes=10,      # Matches the number of output classes
+            dropout=0.5,         # Use the same dropout as in training
+            bidirectional=True   # Ensure bidirectional LSTM
+            )
+
             model.load_state_dict(torch.load('fingering_bilstm_model.pth', map_location=torch.device('cpu')))
         except FileNotFoundError:
             print("Error: 'fingering_bilstm_model.pth' not found. 请先运行 'model_training.py'。")
@@ -524,23 +612,37 @@ def main():
         chord_note_count = sum(len(element.notes) for element in score.flat.getElementsByClass(chord.Chord))
         total_notes = note_count + chord_note_count
 
-        if len(fingering_labels) != total_notes:
-            print(f"预测的指法数量 ({len(fingering_labels)}) 与音符数量 ({total_notes}) 不一致！")
-        else:
-            fingering_index = 0
-            for part in score.parts:
-                for element in part.flat.notes:
-                    if isinstance(element, note.Note):
+        #if len(fingering_labels) != total_notes:
+        #    print(f"预测的指法数量 ({len(fingering_labels)}) 与音符数量 ({total_notes}) 不一致！")
+        if len(fingering_labels) > total_notes:
+            print(f"Trimming excess predictions: {len(fingering_labels) - total_notes}")
+            fingering_labels = fingering_labels[:total_notes]  # Trim extra predictions
+        elif len(fingering_labels) < total_notes:
+            print(f"Padding missing predictions: {total_notes - len(fingering_labels)}")
+            padding = np.full((total_notes - len(fingering_labels),), -1, dtype=fingering_labels.dtype)
+            fingering_labels = np.concatenate((fingering_labels, padding))
+
+        print(f"Final predictions after adjustment: {len(fingering_labels)} (Expected: {total_notes})")
+
+
+        fingering_index = 0
+        for part in score.parts:
+            for element in part.flat.notes:
+                if isinstance(element, note.Note):
+                    if fingering_index < len(fingering_labels):
                         fingering_number = fingering_labels[fingering_index]
                         fingering_articulation = articulations.Fingering(fingering_number)
                         element.articulations.append(fingering_articulation)
                         fingering_index += 1
-                    elif isinstance(element, chord.Chord):
-                        for n in element.notes:
+                elif isinstance(element, chord.Chord):
+                    for n in element.notes:
+                        if fingering_index < len(fingering_labels):
                             fingering_number = fingering_labels[fingering_index]
                             fingering_articulation = articulations.Fingering(fingering_number)
                             n.articulations.append(fingering_articulation)
                             fingering_index += 1
+          
+                    
 
         modified_musicxml_path = 'modified_example.mxl'
         score.write('mxl', fp=modified_musicxml_path)
