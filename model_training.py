@@ -111,7 +111,7 @@ def main():
 
     num_epochs = 100
     best_val_loss = float('inf')
-    patience = 5
+    patience = 10
     trigger_times = 0
     best_model_state = None
 

@@ -156,22 +156,22 @@ def is_black_key(midi_number):
 
 
 def calculate_speed_features(df, window=1.0):
-    """确保与训练集一致的密度计算方式"""
-    # 先获取训练集的密度范围
-    train_df = pd.read_pickle('df.pkl')
-    max_density = train_df['note_density'].max()
-    min_density = train_df['note_density'].min()
+    df = df.copy()
 
-    # 计算密度并归一化到训练集范围
-    def calculate_density(start_time, window):
-        end_time = start_time + window
-        count = df[(df['onset_time'] >= start_time) &
-                   (df['onset_time'] < end_time)].shape[0]
-        # 归一化到训练集范围
-        normalized_count = int((count - min_density) / (max_density - min_density) * max_density)
-        return normalized_count
+    # 计算真实时值
+    df['real_duration'] = df['offset_time'] - df['onset_time']
 
-    df['note_density'] = df['onset_time'].apply(lambda x: calculate_density(x, window))
+    # 计算稠密度
+    def calculate_density(df, window=1.0):
+        density = []
+        for idx, row in df.iterrows():
+            start = row['onset_time']
+            end = start + window
+            count = df[(df['onset_time'] > start) & (df['onset_time'] <= end)].shape[0]
+            density.append(count)
+        return density
+
+    df['note_density'] = calculate_density(df, window)
     return df
 
 def calculate_midi_diff(df):

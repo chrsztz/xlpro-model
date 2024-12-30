@@ -8,7 +8,6 @@ from models import BiLSTMWithAttention
 from data_utils import (
     load_pickle,
     normalize_spelled_pitch,
-    calculate_speed_features,
     calculate_midi_diff,
     create_word_column,
     get_fused_features,
@@ -19,6 +18,24 @@ from data_utils import (
 from gensim.models import Word2Vec
 import pandas as pd
 
+def calculate_speed_features(df, window=1.0):
+    """确保与训练集一致的密度计算方式"""
+    # 先获取训练集的密度范围
+    train_df = pd.read_pickle('df.pkl')
+    max_density = train_df['note_density'].max()
+    min_density = train_df['note_density'].min()
+
+    # 计算密度并归一化到训练集范围
+    def calculate_density(start_time, window):
+        end_time = start_time + window
+        count = df[(df['onset_time'] >= start_time) &
+                   (df['onset_time'] < end_time)].shape[0]
+        # 归一化到训练集范围
+        normalized_count = int((count - min_density) / (max_density - min_density) * max_density)
+        return normalized_count
+
+    df['note_density'] = df['onset_time'].apply(lambda x: calculate_density(x, window))
+    return df
 
 def validate_features(df_train, df_pred, feature_name):
     """验证特征分布"""
