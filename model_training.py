@@ -81,8 +81,8 @@ def main():
     # model = TransformerModel(input_size, hidden_size_tr, num_heads, num_layers_tr, num_classes, dropout)
 
     # 选择设备
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     model.to(device)
 
     print(model)
@@ -103,8 +103,8 @@ def main():
     class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train_aug), y=y_train_aug)
     class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
 
-    # 使用 Focal Loss
-    criterion = FocalLoss(alpha=1, gamma=2)
+    # 假设有效指法为 1,2,3,4,5，未标注记为0
+    criterion = nn.CrossEntropyLoss(ignore_index=10)
 
     # 学习率调度器
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)

@@ -5,6 +5,7 @@ import pandas as pd
 import pickle
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from gensim.models import Word2Vec
+import gc
 
 ENHARMONIC_MAPPING = {
     # 双降音符
@@ -77,12 +78,16 @@ for key, value in ENHARMONIC_MAPPING.items():
     REVERSE_ENHARMONIC_MAPPING[value].append(key)
 
 class CustomFingeringEncoder:
-    """自定义指法编码器，处理钢琴指法的编码和解码"""
+    """自定义指法编码器，处理钢琴指法的编码和解码。
+       右手指法为正数，左手指法为负数；新数据集中未标注的指法（0）将被映射为10，
+       并在训练时通过损失函数忽略（ignore_index=10）。
+    """
 
     def __init__(self):
         self.mapping = {
-            -5: 0, -4: 1, -3: 2, -2: 3, -1: 4,  # 左手
-            1: 5, 2: 6, 3: 7, 4: 8, 5: 9  # 右手
+            -5: 0, -4: 1, -3: 2, -2: 3, -1: 4,  # 左手指法：-5到-1映射到0-4
+             0: 10,                             # 未标注的指法（0）映射为10（ignore index）
+             1: 5, 2: 6, 3: 7, 4: 8, 5: 9         # 右手指法：1到5映射到5-9
         }
         self.inverse_mapping = {v: k for k, v in self.mapping.items()}
 
@@ -94,9 +99,11 @@ class CustomFingeringEncoder:
         return self
 
     def transform(self, y):
+        # 未在映射中的指法将返回 -1（一般不应出现，因为fit已经检查过）
         return np.array([self.mapping.get(val, -1) for val in y])
 
     def inverse_transform(self, y):
+        # 未知转换默认返回 0
         return np.array([self.inverse_mapping.get(val, 0) for val in y])
 
     def __getstate__(self):
@@ -155,22 +162,30 @@ def is_black_key(midi_number):
     return 1 if (midi_number % 12) in black_keys else 0
 
 
+def calculate_density(df, window=1.0):
+    """
+    使用向量化的方法计算每个音符在给定时间窗口内的密度。
+    """
+    # 提取所有音符的 onset_time 并排序
+    onset_times = df['onset_time'].values
+    sorted_onsets = np.sort(onset_times)
+
+    # 对每个音符，利用 np.searchsorted 查找 t + window 的位置
+    lower_indices = np.searchsorted(sorted_onsets, onset_times, side='left')
+    upper_indices = np.searchsorted(sorted_onsets, onset_times + window, side='right')
+
+    # 计算窗口内的音符数量
+    density = upper_indices - lower_indices
+
+    return density.tolist()
+
 def calculate_speed_features(df, window=1.0):
     df = df.copy()
 
     # 计算真实时值
     df['real_duration'] = df['offset_time'] - df['onset_time']
 
-    # 计算稠密度
-    def calculate_density(df, window=1.0):
-        density = []
-        for idx, row in df.iterrows():
-            start = row['onset_time']
-            end = start + window
-            count = df[(df['onset_time'] > start) & (df['onset_time'] <= end)].shape[0]
-            density.append(count)
-        return density
-
+    # 计算稠密度（向量化实现）
     df['note_density'] = calculate_density(df, window)
     return df
 
@@ -265,6 +280,36 @@ def combine_features(df, feature_columns):
     assert sample_dim == 136, f"Expected 136 features, got {sample_dim}"
 
     return df
+
+def process_fused_features(df, scaler_fused=None, batch_size=10000):
+    """
+    将融合特征分批处理，并使用增量标准化。
+    如果 scaler_fused 为 None，则新建一个 StandardScaler，否则使用传入的 scaler 进行增量拟合。
+    返回标准化后的融合特征列表。
+    """
+    # 得到所有融合特征列表，每个元素为一个 128 维向量
+    fused_features_list = df['fused_feature'].tolist()
+    fused_features_array = np.array(fused_features_list)  # 尽量不要重复复制整个数据
+
+    n_samples = fused_features_array.shape[0]
+    if scaler_fused is None:
+        scaler_fused = StandardScaler()
+
+    # 如果数据量很大，使用 partial_fit 进行增量标准化
+    for start in range(0, n_samples, batch_size):
+        end = min(start + batch_size, n_samples)
+        scaler_fused.partial_fit(fused_features_array[start:end])
+
+    # 对每个批次进行 transform 并存回列表，避免一次性加载整个标准化数据
+    normalized_batches = []
+    for start in range(0, n_samples, batch_size):
+        end = min(start + batch_size, n_samples)
+        batch_transformed = scaler_fused.transform(fused_features_array[start:end])
+        normalized_batches.append(batch_transformed)
+        # 释放内存
+        gc.collect()
+    fused_features_scaled = np.vstack(normalized_batches)
+    return scaler_fused, fused_features_scaled
 
 def save_pickle(obj, filename):
     """

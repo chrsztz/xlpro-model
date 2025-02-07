@@ -21,45 +21,30 @@ from data_utils import (
 
 def mark_chords(df):
     """
-    标记 'chord' 列为 1 如果同一曲目 (piece_id) 同一手部 (hand) 内有多个音符的时间区间重叠。
-    否则，标记为 0。
+    标记 'chord' 列为 1 如果同一曲目 (piece_id) 同一手部 (hand) 内有多个音符的时间区间重叠，
+    否则，标记为 0。利用 np.searchsorted 提速。
     """
     df['chord'] = 0  # 初始化为 0
 
-    # 按 'piece_id' 和 'hand' 分组
-    grouped = df.groupby(['piece_id', 'hand'])
-
+    # 分组处理：每个分组对应同一 piece_id 和 hand
     def mark_chords_group(group):
-        """
-        对每个分组（同一曲目同一手部）标记和弦。
-        """
+        # 按 onset_time 排序
         group = group.sort_values('onset_time').reset_index(drop=True)
-        n = len(group)
-        chord_indices = set()
+        onsets = group['onset_time'].values
+        offsets = group['offset_time'].values
+        n = len(onsets)
+        chord_mask = np.zeros(n, dtype=bool)
 
+        # 对于每个音符，利用 np.searchsorted 查找该音符的 offset 在已排序 onsets 中的插入位置
+        # 该位置 j 表示 group 中从索引 i 到 j-1 的音符的 onset_time 都小于当前音符的 offset，即发生重叠
+        js = np.array([np.searchsorted(onsets, offsets[i], side='left') for i in range(n)])
         for i in range(n):
-            current_onset = group.loc[i, 'onset_time']
-            current_offset = group.loc[i, 'offset_time']
-
-            for j in range(i + 1, n):
-                next_onset = group.loc[j, 'onset_time']
-                next_offset = group.loc[j, 'offset_time']
-
-                if next_onset < current_offset:  # 重叠
-                    chord_indices.add(i)
-                    chord_indices.add(j)
-                else:
-                    break  # 因为已排序，后续不会再重叠
-
-        # 将重叠的音符标记为和弦
-        if chord_indices:
-            group.loc[list(chord_indices), 'chord'] = 1
-
+            if js[i] - i > 1:  # 如果当前音符至少与后面一个音符重叠
+                chord_mask[i:js[i]] = True
+        group['chord'] = chord_mask.astype(int)
         return group
 
-    # 应用到每个分组
-    df = grouped.apply(mark_chords_group).reset_index(drop=True)
-
+    df = df.groupby(['piece_id', 'hand'], group_keys=False).apply(mark_chords_group)
     return df
 
 def parse_fingering_file(file_path):
@@ -155,7 +140,7 @@ def plot_duration_distribution(df):
 
 def main():
     # 设置 fingering 文件夹路径
-    fingering_folder = 'PIGdata/FingeringFiles'  # 请根据实际路径调整
+    fingering_folder = 'ThumbSet/FingeringFiles'  # 请根据实际路径调整
 
     # 加载数据
     df = load_pig_dataset(fingering_folder)
@@ -164,8 +149,8 @@ def main():
     print("初始数据样例：")
     print(df.head())
 
-    # 删除指法缺失的音符
-    df = df.dropna(subset=['finger_number'])
+    # 对于未标注的音符，统一标记为 0（保留上下文信息）
+    df['finger_number'] = df['finger_number'].fillna(0).astype(int)
 
     # 确保指法为整数类型
     df['finger_number'] = df['finger_number'].astype(int)

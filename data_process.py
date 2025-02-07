@@ -16,7 +16,8 @@ from data_utils import (
     get_fused_features,
     combine_features,
     save_pickle,
-    load_pickle
+    load_pickle,
+    process_fused_features
 )
 from gensim.models import Word2Vec
 
@@ -47,14 +48,16 @@ def main():
     # 加载 DataFrame
     try:
         df = pd.read_pickle('df.pkl')
-        print(type(df))
+        print(type(df),len(df))
     except FileNotFoundError:
         print("Error: 'df.pkl' not found. 请在 'dataset_prep.py' 中添加保存 DataFrame 的代码。")
         return
 
     # 计算额外特征
     df = calculate_midi_diff(df)
+    print("done")
     df = calculate_speed_features(df)
+    print("done")
 
     # 添加黑键标识符
     df['black_key'] = df['midi_number'].apply(is_black_key)
@@ -86,15 +89,10 @@ def main():
     # 获取融合特征
     df = get_fused_features(df, word2vec_model, tokenized_sentences)
 
-    # 将融合特征向量转化为多维特征
-    fused_features = np.vstack(df['fused_feature'].values)
-
     # 标准化融合特征
-    scaler_fused = StandardScaler()
-    fused_features_scaled = scaler_fused.fit_transform(fused_features)
-
-    # 将融合特征添加到原始特征中
+    scaler_fused, fused_features_scaled = process_fused_features(df, scaler_fused=None, batch_size=10000)
     df['fused_feature_scaled'] = list(fused_features_scaled)
+    print("done")
 
     # 更新特征集
     feature_columns_extended = ['pitch_encoded', 'duration_encoded', 'hand_encoded',
