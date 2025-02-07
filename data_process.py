@@ -6,6 +6,7 @@ import pickle
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE
+from joblib import Parallel, delayed
 from data_utils import (
     get_midi_number,
     is_black_key,
@@ -78,12 +79,11 @@ def main():
     # 将 'word' 列拆分为单词列表
     tokenized_sentences = df['word'].apply(lambda x: x.split()).tolist()
     # 训练 Word2Vec-CBOW 模型
-    word2vec_model = train_word2vec(tokenized_sentences, window=2, vector_size=128, min_count=1, workers=4)
+    word2vec_model = train_word2vec(tokenized_sentences, window=2, vector_size=128, min_count=1, workers=14)
     # **修改部分结束**
 
     # 保存模型
     word2vec_model.save("word2vec_cbow.model")
-
     print("Word2Vec 模型已训练并保存。")
 
     # 获取融合特征
@@ -161,39 +161,60 @@ def main():
     print(f"过采样后验证集序列形状: {X_val_resampled.shape}, 标签形状: {y_val_resampled.shape}")
 
     # 数据增强：镜像对称
-    def augment_mirror_symmetry(X, y, le_fingering, le_hand):
+    def process_sample(i, X, y, le_fingering, le_hand, hand_index=2):
         """
-        利用左右手镜像对称进行数据增强。
+        对第 i 个样本进行镜像对称数据增强处理。
+        如果样本为左手，则转换为右手，并翻转指法。
         """
-        X_aug = []
-        y_aug = []
+        # 如果该样本的最后一个时间步的 hand_encoded 对应 'left'
+        if X[i, -1, hand_index] == le_hand.transform(['left'])[0]:
+            # 复制当前样本数据
+            X_mirror = X[i].copy()
+            # 将手部特征转换为右手
+            X_mirror[:, hand_index] = le_hand.transform(['right'])[0]
+            # 定义指法翻转规则（假设5个手指，1↔5, 2↔4, 3不变）
+            finger_flip = {0: 4, 1: 3, 2: 2, 3: 1, 4: 0}
+            # 翻转指法标签
+            y_mirror = np.array([finger_flip.get(f, f) for f in y[i]])
+            return X_mirror, y_mirror
+        else:
+            return None, None
 
-        for i in range(len(X)):
-            # 假设 'hand_encoded' 是特征中的一个维度，且为特定索引
-            hand_index = 2  # 根据实际特征顺序调整
-            if X[i, -1, hand_index] == le_hand.transform(['left'])[0]:
-                # 将左手数据转换为右手数据
-                X_mirror = X[i].copy()
-                X_mirror[:, hand_index] = le_hand.transform(['right'])[0]
+    def augment_mirror_symmetry_parallel(X, y, le_fingering, le_hand, hand_index=2, n_jobs=-1):
+        """
+        利用左右手镜像对称进行数据增强，采用并行计算。
 
-                # 翻转指法（具体翻转规则需根据手指编号定义）
-                # 假设有 5 个手指，翻转规则如：1↔5, 2↔4, 3不变
-                finger_flip = {0: 4, 1: 3, 2: 2, 3: 1, 4: 0}
-                y_mirror = np.array([finger_flip.get(f, f) for f in y[i]])
+        参数:
+          - X: 原始序列数据，形状 (n_samples, seq_length, feature_dim)
+          - y: 对应标签，形状 (n_samples, )
+          - le_fingering, le_hand: 已训练的 LabelEncoder 对象
+          - hand_index: 在特征维度中，表示手部编码的位置
+          - n_jobs: 并行使用的作业数（-1 表示使用所有核）
 
-                X_aug.append(X_mirror)
-                y_aug.append(y_mirror)
+        返回:
+          - X_new, y_new: 增强后的数据（原始数据加上镜像增强数据）
+        """
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(process_sample)(i, X, y, le_fingering, le_hand, hand_index) for i in range(len(X))
+        )
+        # 过滤出不为 None 的结果
+        X_aug = [res[0] for res in results if res[0] is not None]
+        y_aug = [res[1] for res in results if res[1] is not None]
 
         if X_aug:
             X_aug = np.array(X_aug)
             y_aug = np.array(y_aug)
-            return np.concatenate((X, X_aug), axis=0), np.concatenate((y, y_aug), axis=0)
+            X_new = np.concatenate((X, X_aug), axis=0)
+            y_new = np.concatenate((y, y_aug), axis=0)
+            return X_new, y_new
         else:
             return X, y
 
-    # 执行数据增强
-    X_train_aug, y_train_aug = augment_mirror_symmetry(X_train_resampled, y_train_resampled, le_fingering, le_hand)
-    X_val_aug, y_val_aug = augment_mirror_symmetry(X_val_resampled, y_val_resampled, le_fingering, le_hand)
+    # 在您的数据增强部分替换原来的 augment_mirror_symmetry 函数调用：
+    X_train_aug, y_train_aug = augment_mirror_symmetry_parallel(X_train_resampled, y_train_resampled, le_fingering,
+                                                                le_hand, hand_index=2, n_jobs=-1)
+    X_val_aug, y_val_aug = augment_mirror_symmetry_parallel(X_val_resampled, y_val_resampled, le_fingering, le_hand,
+                                                            hand_index=2, n_jobs=-1)
 
     print(f"增强后训练集序列形状: {X_train_aug.shape}, 标签形状: {y_train_aug.shape}")
     print(f"增强后验证集序列形状: {X_val_aug.shape}, 标签形状: {y_val_aug.shape}")

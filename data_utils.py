@@ -231,28 +231,31 @@ def train_word2vec(sentences, window=2, vector_size=128, min_count=1, workers=4)
 # data_utils.py
 
 def get_fused_features(df, word2vec_model, tokenized_sentences):
-    """获取融合特征，确保维度为128（因为基础特征是8维，总共需要136维）"""
+    """
+    获取融合特征，通过 Word2Vec 将 'word' 列转换为向量，确保最终向量维度为128。
+    对于未在词汇表中的单词，使用全零向量代替。
+    优化点：使用局部变量缓存词向量对象，减少函数调用开销。
+    """
+    wv = word2vec_model.wv
+    vector_size = wv.vector_size
 
     def get_vector(tokens):
-        vectors = []
-        for token in tokens:
-            if token in word2vec_model.wv:
-                vectors.append(word2vec_model.wv[token])
-            else:
-                vectors.append(np.zeros(word2vec_model.vector_size))
+        # 尝试用列表推导获取所有词的向量
+        vectors = [wv[token] if token in wv else np.zeros(vector_size) for token in tokens]
         if vectors:
             base_vector = np.mean(vectors, axis=0)
-            # 确保维度为128
-            if len(base_vector) > 128:
+            # 保证维度为128
+            if base_vector.shape[0] > 128:
                 return base_vector[:128]
-            elif len(base_vector) < 128:
-                padding = np.zeros(128 - len(base_vector))
+            elif base_vector.shape[0] < 128:
+                padding = np.zeros(128 - base_vector.shape[0])
                 return np.concatenate([base_vector, padding])
             return base_vector
         return np.zeros(128)
 
-    # 使用list comprehension处理tokenized_sentences
-    df['fused_feature'] = [get_vector(tokens) for tokens in tokenized_sentences]
+    # 使用列表推导替代 DataFrame.apply
+    fused_features = [get_vector(tokens) for tokens in tokenized_sentences]
+    df['fused_feature'] = fused_features
 
     # 验证维度
     sample_dim = len(df['fused_feature'].iloc[0])
@@ -261,21 +264,22 @@ def get_fused_features(df, word2vec_model, tokenized_sentences):
 
     return df
 
-
 def combine_features(df, feature_columns):
-    """将融合特征与原始特征组合，确保总维度为136"""
+    """将融合特征与原始特征组合，确保总维度为136（基础特征8维 + 融合特征128维）。"""
+    # 获取基础特征矩阵，假设 df[feature_columns] 返回的 shape 为 (n_samples, 8)
+    base_features = df[feature_columns].values  # (n, 8)
 
-    def combine(row):
-        # 基础特征
-        base_features = row[feature_columns].values  # 8维
-        # 融合特征应该是128维 (136-8=128)
-        fused_features = row['fused_feature_scaled']
-        return np.concatenate([base_features, fused_features])
+    # 将融合特征从 DataFrame 列转换为 NumPy 数组
+    fused_features = np.stack(df['fused_feature_scaled'].values)  # (n, 128)
 
-    df['combined_features'] = df.apply(combine, axis=1)
+    # 直接水平拼接两个矩阵
+    combined = np.concatenate([base_features, fused_features], axis=1)  # (n, 136)
+
+    # 将结果重新存回 DataFrame 的新列（这里存为列表以保持原有接口）
+    df['combined_features'] = list(combined)
 
     # 验证维度
-    sample_dim = len(df['combined_features'].iloc[0])
+    sample_dim = combined.shape[1]
     print(f"Combined feature dimension: {sample_dim}")
     assert sample_dim == 136, f"Expected 136 features, got {sample_dim}"
 
