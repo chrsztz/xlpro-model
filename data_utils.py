@@ -264,7 +264,6 @@ def get_fused_features(df, word2vec_model, tokenized_sentences):
 
     return df
 
-
 def combine_features(df, feature_columns):
     """将融合特征与原始特征组合，确保总维度为136（基础特征8维 + 融合特征128维）。"""
     # 获取基础特征矩阵，假设 df[feature_columns] 返回的 shape 为 (n_samples, 8)
