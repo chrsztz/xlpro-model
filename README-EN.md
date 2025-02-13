@@ -1,6 +1,6 @@
 # 🎹 Deep Learning-Based Piano Fingering Prediction Model 🎶  
 <p align="center">
-  🌍 <a href="https://github.com/chrsztz/xlpro-model/blob/main/readme_en.md">English Version</a> | 🎹 <a href="https://github.com/chrsztz/xlpro-model">中文版本</a> 🌍
+  🇬🇧 <a href="https://github.com/chrsztz/xlpro-model/blob/main/readme_en.md">English Version</a> | 🎹 <a href="https://github.com/chrsztz/xlpro-model">中文版本</a> 🇨🇳
 </p>
 
 In collaboration with the **PhD research lab at our school** and a **PhD candidate in Computer Science at the National University of Defense Technology**, this project focuses on **AI deep learning and cloud computing**, aiming to develop an **AI-powered piano fingering prediction model**.  
