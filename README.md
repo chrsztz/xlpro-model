@@ -1,4 +1,7 @@
 # 🎹 基于深度学习的钢琴指法预测模型开发 🎶  
+<p align="center">
+  🇬🇧 <a href="https://github.com/chrsztz/xlpro-model/blob/main/readme_en.md">English Version</a> | 🇨🇳 <a href="https://github.com/chrsztz/xlpro-model">中文版本</a> 🎹
+</p>
 
 在 **学校博士工作室** 与 **国防科技大学计算机博士** 合作，围绕 **AI 深度学习与云计算** 进行开发，研究主题为 **基于深度学习的钢琴指法预测**。  
 
