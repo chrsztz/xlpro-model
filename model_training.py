@@ -1,26 +1,32 @@
-# model_training.py
+#model_training.py
 import torch
-import os
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch.utils.data import DataLoader, Dataset
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
 import pickle
-from torch.utils.data import DataLoader, IterableDataset
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from sklearn.utils.class_weight import compute_class_weight
-from tqdm import tqdm 
-from data_utils import load_pickle
-from models import TransformerModel,BiGRU,BiLSTM,BiLSTMWithAttention
+from data_utils import load_pickle  # 用于加载 LabelEncoder
+from models import BiLSTMWithAttention  # 示例模型，可以替换为其他模型
+from torch.cuda.amp import GradScaler, autocast
 
-# 定义 Focal Loss
+# Focal Loss 定义，用于处理类别不平衡和难分类样本
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+    def __init__(self, alpha=1, gamma=2, reduction='mean', ignore_index=10):
         super(FocalLoss, self).__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+        self.ignore_index = ignore_index
 
     def forward(self, inputs, targets):
+        mask = targets != self.ignore_index
+        inputs = inputs[mask]
+        targets = targets[mask]
+        if inputs.size(0) == 0:
+            return torch.tensor(0.0, device=inputs.device)
+
         BCE_loss = F.cross_entropy(inputs, targets, reduction='none')
         pt = torch.exp(-BCE_loss)
         F_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
@@ -32,174 +38,179 @@ class FocalLoss(nn.Module):
         else:
             return F_loss
 
+# 自定义 Dataset，支持动态镜像增强
+class FingeringDataset(Dataset):
+    def __init__(self, X, y, le_hand, hand_index=2, mirror_prob=0.5):
+        self.X = X
+        self.y = y
+        self.le_hand = le_hand
+        self.hand_index = hand_index
+        self.mirror_prob = mirror_prob
 
-class FingeringIterableDataset(IterableDataset):
-    """
-    使用内存映射的 npy 文件，并按 batch_size 切片迭代，不一次性加载整个数据。
-    """
-    def __init__(self, X_path, y_path, batch_size=64, mmap_mode='r'):
-        super().__init__()
-        # 使用内存映射方式读取
-        self.X = np.load(X_path, mmap_mode=mmap_mode)
-        self.y = np.load(y_path, mmap_mode=mmap_mode)
+    def __len__(self):
+        return len(self.X)
 
-        self.batch_size = batch_size
-        self.n_samples = self.X.shape[0]
-        assert self.X.shape[0] == self.y.shape[0], "X 与 y 行数不一致！"
+    def __getitem__(self, idx):
+        X_sample = self.X[idx].copy()
+        y_sample = self.y[idx].copy()
 
-    def __iter__(self):
-        # 按 batch_size 切片顺序返回
-        for start in range(0, self.n_samples, self.batch_size):
-            end = min(start + self.batch_size, self.n_samples)
-            # 此处只在需要时才将对应切片加载到内存
-            X_slice = torch.tensor(self.X[start:end], dtype=torch.float32)
-            y_slice = torch.tensor(self.y[start:end], dtype=torch.long)
-            yield X_slice, y_slice
+        # 动态镜像增强
+        if np.random.rand() < self.mirror_prob:
+            if X_sample[-1, self.hand_index] == self.le_hand.transform(['left'])[0]:
+                X_sample[:, self.hand_index] = self.le_hand.transform(['right'])[0]
+            else:
+                X_sample[:, self.hand_index] = self.le_hand.transform(['left'])[0]
+            # 指法翻转规则
+            finger_flip = {0: 4, 1: 3, 2: 2, 3: 1, 4: 0, 5: 9, 6: 8, 7: 7, 8: 6, 9: 5}
+            y_sample = np.array([finger_flip.get(f, f) for f in y_sample])
+
+        return torch.tensor(X_sample, dtype=torch.float32), torch.tensor(y_sample, dtype=torch.long)
+
+def train_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0
+    # scaler = GradScaler()
+    # # 在 train_epoch 中：
+    # with autocast():
+    #     outputs = model(X_batch)
+    #     loss = criterion(outputs, y_batch)
+    # scaler.scale(loss).backward()
+    # scaler.step(optimizer)
+    # scaler.update()
+    for X_batch, y_batch in tqdm(loader, desc="Training"):
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度裁剪
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for X_batch, y_batch in loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            total_loss += loss.item()
+            _, predicted = torch.max(outputs, 1)
+            total += (y_batch != 10).sum().item()
+            correct += (predicted == y_batch).sum().item()
+    avg_loss = total_loss / len(loader)
+    accuracy = correct / total if total > 0 else 0
+    return avg_loss, accuracy
 
 def main():
-    # 加载增强后的数据（使用内存映射 + 只在IterableDataset中读取）
-    train_X_path = 'data/X_train_aug.npy'
-    train_y_path = 'data/y_train_aug.npy'
-    val_X_path   = 'data/X_val_aug.npy'
-    val_y_path   = 'data/y_val_aug.npy'
+    # 数据路径
+    train_X_path = 'data/X_train.npy'
+    train_y_path = 'data/y_train.npy'
+    val_X_path = 'data/X_val.npy'
+    val_y_path = 'data/y_val.npy'
 
-    # 确保这几个文件存在
-    for f in [train_X_path, train_y_path, val_X_path, val_y_path]:
-        if not os.path.exists(f):
-            print(f"未找到文件: {f}")
-            return
+    # 加载数据
+    X_train = np.load(train_X_path, mmap_mode='r')
+    y_train = np.load(train_y_path, mmap_mode='r')
+    X_val = np.load(val_X_path, mmap_mode='r')
+    y_val = np.load(val_y_path, mmap_mode='r')
 
     # 加载 LabelEncoders
-    try:
-        le_fingering = load_pickle('data/le_fingering.pkl')
-        le_hand = load_pickle('data/le_hand.pkl')
-    except FileNotFoundError as e:
-        print(f"Error loading LabelEncoders: {e}")
-        print("请确保已运行 'dataset_prep.py' 并生成相关的 .pkl 文件。")
-        return
+    le_hand = load_pickle('data/le_hand.pkl')
+    le_fingering = load_pickle('data/le_fingering.pkl')
 
-    # 参数设置
-    # 初始化网络参数
-    # 这里先简单用内存映射看看 X_train_aug 的第三维度（特征数），读取一小部分
-    X_train_tmp = np.load(train_X_path, mmap_mode='r')
-    input_size = X_train_tmp.shape[2]  # 读取 shape 以确定特征维度
-    print("input_size =", input_size)
-    hidden_size = 512
-    num_layers = 3
+    # 分离标注和未标注数据（未标注数据标记为10）
+    labeled_idx = y_train != 10
+    X_train_labeled = X_train[labeled_idx]
+    y_train_labeled = y_train[labeled_idx]
+    X_train_unlabeled = X_train[~labeled_idx]
+
+    # 模型参数
+    input_size = X_train.shape[2]
+    hidden_size = 256
+    num_layers = 2
     num_classes = 10
-    dropout = 0.5
+    dropout = 0.3
 
     # 初始化模型
-    # 选择您要使用的模型，取消相应的注释
     model = BiLSTMWithAttention(input_size, hidden_size, num_layers, num_classes, dropout)
-    # model = BiLSTM(input_size, hidden_size, num_layers, num_classes, dropout)
-    # model = BiGRU(input_size, hidden_size, num_layers, num_classes, dropout)
-    # model = TransformerModel(input_size, hidden_size_tr, num_heads, num_layers_tr, num_classes, dropout)
-
-    # 选择设备
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     model.to(device)
 
-    print(model)
+    # 数据加载器
+    train_dataset = FingeringDataset(X_train_labeled, y_train_labeled, le_hand, mirror_prob=0.5)
+    val_dataset = FingeringDataset(X_val, y_val, le_hand, mirror_prob=0.0)  # 验证集不增强
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
-    # 使用 IterableDataset 构建 DataLoader
-    batch_size = 64
-    train_dataset = FingeringIterableDataset(train_X_path, train_y_path, batch_size=batch_size, mmap_mode='r')
-    val_dataset = FingeringIterableDataset(val_X_path, val_y_path, batch_size=batch_size, mmap_mode='r')
-
-    # DataLoader 传入 batch_size=None，因为 IterableDataset 本身已经按 batch 产出
-    train_loader = DataLoader(train_dataset, batch_size=None, shuffle=False)
-    val_loader = DataLoader(val_dataset, batch_size=None, shuffle=False)
-
-    # 定义优化器
+    # 优化器、损失函数和调度器
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    criterion = FocalLoss(alpha=1, gamma=2, ignore_index=10)
+    scheduler = CosineAnnealingLR(optimizer, T_max=10, eta_min=0.0001)
 
-    # 计算类别权重
-    # 若需要 class_weight，请先把 y_train_aug 以内存映射或分批取值统计
-    # 这里简单演示：只要能一次性读取 y_train_aug 即可
-    y_train_full = np.load(train_y_path, mmap_mode='r')
-    class_values = np.unique(y_train_full)
-    from sklearn.utils.class_weight import compute_class_weight
-    class_weights = compute_class_weight(class_weight='balanced', classes=class_values, y=y_train_full)
-    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
-
-    # 假设有效指法为 1,2,3,4,5，未标注记为0, ignore_index=10
-    criterion = nn.CrossEntropyLoss(ignore_index=10)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-
-    num_epochs = 100
+    # 训练参数
+    num_epochs = 50
     best_val_loss = float('inf')
-    patience = 10
+    patience = 5
     trigger_times = 0
-    best_model_state = None
 
+    print("开始初始训练...")
     for epoch in range(num_epochs):
-        # 训练阶段
-        model.train()
-        train_loss = 0
-        train_count = 0
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_accuracy = evaluate(model, val_loader, criterion, device)
 
-        # 遍历 train_loader，每个批次由 IterableDataset 产出
-        for X_batch, y_batch in tqdm(train_loader, desc=f"Training Epoch {epoch + 1}", leave=False, ncols=100,
-                             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"):
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, "
+              f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
 
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
+        scheduler.step()
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item() * X_batch.size(0)
-            train_count += X_batch.size(0)
-
-        train_loss /= train_count
-
-        # 验证阶段
-        model.eval()
-        val_loss = 0
-        val_count = 0
-        with torch.no_grad():
-            for X_batch, y_batch in tqdm(val_loader, desc="Validation", leave=False, ncols=100,
-                                 bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"):
-                X_batch = X_batch.to(device)
-                y_batch = y_batch.to(device)
-
-                outputs = model(X_batch)
-                loss = criterion(outputs, y_batch)
-                val_loss += loss.item() * X_batch.size(0)
-                val_count += X_batch.size(0)
-
-        val_loss /= val_count
-
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-
-        # 调整学习率
-        scheduler.step(val_loss)
-
-        current_lrs = scheduler.get_last_lr()
-        print(f"当前学习率: {current_lrs}")
-
-        # Early stopping
+        # 早停机制
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_model_state = model.state_dict()
             trigger_times = 0
+            torch.save(model.state_dict(), 'best_model.pth')
         else:
             trigger_times += 1
-            print(f"Trigger Times: {trigger_times}")
             if trigger_times >= patience:
-                print("Early stopping!")
+                print("触发早停机制，停止训练！")
                 break
 
-    if best_model_state:
-        model.load_state_dict(best_model_state)
+    # 自训练阶段
+    if len(X_train_unlabeled) > 0:
+        print("开始自训练...")
+        model.eval()
+        with torch.no_grad():
+            X_unlabeled_tensor = torch.tensor(X_train_unlabeled, dtype=torch.float32).to(device)
+            outputs = model(X_unlabeled_tensor)
+            probabilities, predicted = torch.max(F.softmax(outputs, dim=1), 1)
+            high_conf_idx = probabilities > 0.9  # 置信度阈值
+            pseudo_X = X_train_unlabeled[high_conf_idx.cpu().numpy()]
+            pseudo_y = predicted[high_conf_idx].cpu().numpy()
 
-    torch.save(model.state_dict(), 'fingering_bilstm_model.pth')
-    print("Model saved as fingering_bilstm_model.pth")
+        if len(pseudo_X) > 0:
+            print(f"添加 {len(pseudo_X)} 个伪标签样本到训练集")
+            X_train_new = np.concatenate([X_train_labeled, pseudo_X], axis=0)
+            y_train_new = np.concatenate([y_train_labeled, pseudo_y], axis=0)
+            train_dataset = FingeringDataset(X_train_new, y_train_new, le_hand, mirror_prob=0.5)
+            train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+
+            # 继续训练
+            model.load_state_dict(torch.load('best_model.pth'))  # 加载最佳模型
+            for epoch in range(10):  # 自训练10个额外epoch
+                train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+                val_loss, val_accuracy = evaluate(model, val_loader, criterion, device)
+                print(f"Self-Training Epoch [{epoch+1}/10], Train Loss: {train_loss:.4f}, "
+                      f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
+                scheduler.step()
+
+    # 保存最终模型
+    torch.save(model.state_dict(), 'fingering_model_final.pth')
+    print("训练完成，模型已保存至 'fingering_model_final.pth'")
 
 if __name__ == "__main__":
     main()

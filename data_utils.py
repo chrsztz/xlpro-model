@@ -114,14 +114,16 @@ class CustomFingeringEncoder:
         self.inverse_mapping = state['inverse_mapping']
 
 def normalize_spelled_pitch(spelled_pitch):
-    """
-    将同音异名的音符标准化为统一的表示（例如，将所有降音符转换为升音符）。
-    """
-    # 分离音名和八度
-    pitch_name = ''.join([c for c in spelled_pitch if c.isalpha() or c in ['#', 'b']])
-    octave = ''.join([c for c in spelled_pitch if c.isdigit()])
-    normalized_pitch = ENHARMONIC_MAPPING.get(pitch_name, pitch_name)  # 默认不变
-    return f"{normalized_pitch}{octave}"
+    """标准化音高表示"""
+    try:
+        match = re.match(r'^([A-Ga-g][#b]{0,2})(\d+)$', spelled_pitch)
+        if not match:
+            raise ValueError(f"Invalid pitch format: {spelled_pitch}")
+        pitch_name, octave = match.groups()
+        normalized_pitch = ENHARMONIC_MAPPING.get(pitch_name, pitch_name)
+        return f"{normalized_pitch}{octave}"
+    except Exception:
+        return "C4"  # 默认值
 
 def denormalize_spelled_pitch(normalized_pitch):
     """
@@ -220,11 +222,10 @@ def create_word_column(df, feature_columns):
     df['word'] = df[feature_columns].astype(str).agg(' '.join, axis=1)
     return df
 
-def train_word2vec(sentences, window=2, vector_size=128, min_count=1, workers=4):
-    """
-    训练 Word2Vec-CBOW 模型，并返回训练好的模型。
-    """
-    model = Word2Vec(sentences, window=window, vector_size=vector_size, min_count=min_count, workers=workers, sg=0)
+def train_word2vec(sentences, window=5, vector_size=64, min_count=5, workers=4):
+    """训练Word2Vec模型，使用CBOW"""
+    model = Word2Vec(sentences, window=window, vector_size=vector_size,
+                     min_count=min_count, workers=workers, sg=0)  # sg=0表示CBOW
     return model
 
 

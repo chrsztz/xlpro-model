@@ -1,12 +1,7 @@
-# data_process.py
-
 import numpy as np
 import pandas as pd
-import pickle
+import torch
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from imblearn.over_sampling import SMOTE
-from joblib import Parallel, delayed
 from data_utils import (
     get_midi_number,
     is_black_key,
@@ -21,212 +16,166 @@ from data_utils import (
     process_fused_features
 )
 from gensim.models import Word2Vec
+from joblib import Parallel, delayed
 
+def process_batch(df_batch, word2vec_model, feature_columns, tokenized_sentences):
+    """分批处理特征工程"""
+    df_batch = create_word_column(df_batch, feature_columns)
+    df_batch = get_fused_features(df_batch, word2vec_model, tokenized_sentences)
+    return df_batch
+
+def sequence_generator(X, y, seq_length, batch_size):
+    """生成器，按需生成序列"""
+    for i in range(0, len(X) - seq_length, batch_size):
+        end = min(i + batch_size, len(X) - seq_length)
+        X_batch = [X[j:j + seq_length] for j in range(i, end)]
+        y_batch = [y[j + seq_length] for j in range(i, end)]
+        yield np.array(X_batch, dtype=np.float32), np.array(y_batch, dtype=np.int64)
 
 def main():
-    # 加载序列数据
+    # 加载初始数据
     try:
-        X_train = np.load('X_train.npy')
-        X_val = np.load('X_val.npy')
-        y_train = np.load('y_train.npy')
-        y_val = np.load('y_val.npy')
+        X_train = np.load('X_train.npy', mmap_mode='r')
+        X_val = np.load('X_val.npy', mmap_mode='r')
+        y_train = np.load('y_train.npy', mmap_mode='r')
+        y_val = np.load('y_val.npy', mmap_mode='r')
     except FileNotFoundError as e:
         print(f"Error loading data files: {e}")
-        print("请确保已运行 'dataset_prep.py' 并生成所需的 .npy 文件。")
         return
 
-    # 加载 LabelEncoders
-    try:
-        le_pitch = load_pickle('le_pitch.pkl')
-        le_duration = load_pickle('le_duration.pkl')
-        le_hand = load_pickle('le_hand.pkl')
-        le_fingering = load_pickle('le_fingering.pkl')
-    except FileNotFoundError as e:
-        print(f"Error loading LabelEncoders: {e}")
-        print("请确保已运行 'dataset_prep.py' 并生成相关的 .pkl 文件。")
-        return
-
-    # 加载 DataFrame
     try:
         df = pd.read_pickle('df.pkl')
-        print(type(df),len(df))
-    except FileNotFoundError:
-        print("Error: 'df.pkl' not found. 请在 'dataset_prep.py' 中添加保存 DataFrame 的代码。")
+    except FileNotFoundError as e:
+        print(f"Error loading DataFrame: {e}")
         return
 
-    # 计算额外特征
-    df = calculate_midi_diff(df)
-    print("done")
-    df = calculate_speed_features(df)
-    print("done")
+    if 'train' not in df.columns:
+        print("Error: 'train' column not found in df.")
+        return
 
-    # 添加黑键标识符
-    df['black_key'] = df['midi_number'].apply(is_black_key)
-    if 'is_chord' not in df.columns:
-        df['is_chord'] = 0
-    df['chord'] = df['is_chord']  # 0 或 1
+    # 划分训练集和验证集
+    df_train = df[df['train'] == 1]
+    df_val = df[df['train'] == 0]
+    print("Number of training samples: {}".format(len(df_train)))
 
-    # 特征提取
+    # 优化数据类型以减少内存占用
+    df_train = df_train.astype({
+        'pitch_encoded': 'int16',
+        'duration_encoded': 'int16',
+        'hand_encoded': 'int8',
+        'midi_number': 'float32',
+        'midi_diff_processed': 'float32',
+        'real_duration': 'float32',
+        'note_density': 'float32',
+        'black_key': 'int8',
+        'chord': 'int8'
+    })
+    df_val = df_val.astype({
+        'pitch_encoded': 'int16',
+        'duration_encoded': 'int16',
+        'hand_encoded': 'int8',
+        'midi_number': 'float32',
+        'midi_diff_processed': 'float32',
+        'real_duration': 'float32',
+        'note_density': 'float32',
+        'black_key': 'int8',
+        'chord': 'int8'
+    })
+
+    # 计算音乐特征
+    df_train = calculate_midi_diff(df_train)
+    df_train = calculate_speed_features(df_train)
+    df_train['black_key'] = df_train['midi_number'].apply(is_black_key)
+    if 'is_chord' not in df_train.columns:
+        df_train['is_chord'] = 0
+    df_train['chord'] = df_train['is_chord']
+
+    df_val = calculate_midi_diff(df_val)
+    df_val = calculate_speed_features(df_val)
+    df_val['black_key'] = df_val['midi_number'].apply(is_black_key)
+    if 'is_chord' not in df_val.columns:
+        df_val['is_chord'] = 0
+    df_val['chord'] = df_val['is_chord']
+    print("已完成音乐特征计算")
+
+    # 训练 Word2Vec 模型
     feature_columns = ['pitch_encoded', 'duration_encoded', 'hand_encoded',
                        'midi_diff_processed', 'real_duration',
                        'note_density', 'black_key', 'chord']
-    df = create_word_column(df, feature_columns)
-
-    print("部分 'word' 列样例：")
-    print(df['word'].head())
-    save_pickle(df, "df.pkl")
-    # **修改部分开始**
-    # 将 'word' 列拆分为单词列表
-    tokenized_sentences = df['word'].apply(lambda x: x.split()).tolist()
-    # 训练 Word2Vec-CBOW 模型
-    word2vec_model = train_word2vec(tokenized_sentences, window=2, vector_size=128, min_count=1, workers=14)
-    # **修改部分结束**
-
-    # 保存模型
+    tokenized_sentences_train = df_train['word'].apply(lambda x: x.split()).tolist() if 'word' in df_train.columns else None
+    if tokenized_sentences_train is None:
+        df_train = create_word_column(df_train, feature_columns)
+        tokenized_sentences_train = df_train['word'].apply(lambda x: x.split()).tolist()
+    word2vec_model = train_word2vec(
+        tokenized_sentences_train, window=5, vector_size=64, min_count=5, workers=4
+    )
     word2vec_model.save("word2vec_cbow.model")
-    print("Word2Vec 模型已训练并保存。")
+    print("word2vec model saved")
 
-    # 获取融合特征
-    df = get_fused_features(df, word2vec_model, tokenized_sentences)
+    # 分批并行处理特征工程
+    batch_size = 50000
+    df_train_batches = [df_train.iloc[i:i + batch_size] for i in range(0, len(df_train), batch_size)]
+    df_val_batches = [df_val.iloc[i:i + batch_size] for i in range(0, len(df_val), batch_size)]
 
-    # 标准化融合特征
-    scaler_fused, fused_features_scaled = process_fused_features(df, scaler_fused=None, batch_size=10000)
-    df['fused_feature_scaled'] = list(fused_features_scaled)
-    print("done")
+    df_train_processed = Parallel(n_jobs=-1)(
+        delayed(process_batch)(batch, word2vec_model, feature_columns, tokenized_sentences_train)
+        for batch in df_train_batches
+    )
+    df_train = pd.concat(df_train_processed)
 
-    # 更新特征集
+    tokenized_sentences_val = df_val['word'].apply(lambda x: x.split()).tolist() if 'word' in df_val.columns else None
+    if tokenized_sentences_val is None:
+        tokenized_sentences_val = [batch['word'].apply(lambda x: x.split()).tolist() for batch in df_val_batches]
+        tokenized_sentences_val = [item for sublist in tokenized_sentences_val for item in sublist]
+    df_val_processed = [process_batch(batch, word2vec_model, feature_columns, tokenized_sentences_val)
+                        for batch in df_val_batches]
+    df_val = pd.concat(df_val_processed)
+
+    scaler_fused, fused_features_scaled_train = process_fused_features(df_train, scaler_fused=None, batch_size=10000)
+    df_train['fused_feature_scaled'] = list(fused_features_scaled_train)
+    _, fused_features_scaled_val = process_fused_features(df_val, scaler_fused=scaler_fused, batch_size=10000)
+    df_val['fused_feature_scaled'] = list(fused_features_scaled_val)
+    print("特征工程完成")
+
+    # 组合特征
     feature_columns_extended = ['pitch_encoded', 'duration_encoded', 'hand_encoded',
                                 'midi_diff_processed', 'real_duration',
                                 'note_density', 'black_key', 'chord']
+    df_train = combine_features(df_train, feature_columns_extended)
+    df_val = combine_features(df_val, feature_columns_extended)
 
-    # 将融合特征附加到原始特征
-    df = combine_features(df, feature_columns_extended)
+    # 转换为数组
+    X_train = np.stack(df_train['combined_features'].values)
+    y_train = df_train['fingering_encoded'].values
+    X_val = np.stack(df_val['combined_features'].values)
+    y_val = df_val['fingering_encoded'].values
 
-    print("部分 'combined_features' 样例：")
-    print(df['combined_features'].head())
+    # GPU加速标准化
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32, device='cuda')
+    X_val_tensor = torch.tensor(X_val, dtype=torch.float32, device='cuda')
+    mean = torch.mean(X_train_tensor, dim=0)
+    std = torch.std(X_train_tensor, dim=0)
+    X_train_scaled = (X_train_tensor - mean) / std
+    X_val_scaled = (X_val_tensor - mean) / std
+    X_train = X_train_scaled.cpu().numpy()
+    X_val = X_val_scaled.cpu().numpy()
+    print("已完成标准化")
 
-    # 提取特征和标签
-    X = np.stack(df['combined_features'].values)
-    y = df['fingering_encoded'].values
+    # 使用生成器生成序列
+    sequence_length = 10
+    batch_size_seq = 10000
 
-    print(f"新特征形状: {X.shape}")
-    print(f"标签形状: {y.shape}")
+    with open('X_train_seq.npy', 'wb') as f_x, open('y_train_seq.npy', 'wb') as f_y:
+        for X_batch, y_batch in sequence_generator(X_train, y_train, sequence_length, batch_size_seq):
+            np.save(f_x, X_batch)
+            np.save(f_y, y_batch)
 
-    # 标准化数值特征（包括融合特征）
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
+    with open('X_val_seq.npy', 'wb') as f_x, open('y_val_seq.npy', 'wb') as f_y:
+        for X_batch, y_batch in sequence_generator(X_val, y_val, sequence_length, batch_size_seq):
+            np.save(f_x, X_batch)
+            np.save(f_y, y_batch)
 
-    # 保存标准化器
-    save_pickle(scaler, 'scaler.pkl')
-
-    # 重新创建序列
-    sequence_length = 10  # 使用前10个音符预测第11个音符
-
-    def create_sequences_full(X, y, seq_length):
-        X_seq = []
-        y_seq = []
-        for i in range(len(X) - seq_length):
-            X_seq.append(X[i:i + seq_length])
-            y_seq.append(y[i + seq_length])
-        return np.array(X_seq), np.array(y_seq)
-
-    X_seq, y_seq = create_sequences_full(X, y, sequence_length)
-
-    print(f"序列特征形状（包含融合特征）: {X_seq.shape}")  # (样本数, sequence_length, 特征数量)
-    print(f"序列标签形状: {y_seq.shape}")  # (样本数,)
-
-    # 划分训练集和验证集
-    X_train_seq, X_val_seq, y_train_seq, y_val_seq = train_test_split(
-        X_seq, y_seq, test_size=0.2, random_state=42, stratify=y_seq
-    )
-
-    print(f"训练集样本数: {X_train_seq.shape[0]}")
-    print(f"验证集样本数: {X_val_seq.shape[0]}")
-
-    # 使用 SMOTE 进行过采样（针对序列数据，需谨慎使用）
-    # 注意：SMOTE 主要适用于非序列数据，以下为一种处理方法
-    # 您也可以选择仅使用类别权重而不使用 SMOTE
-    smote = SMOTE(random_state=42)
-    X_train_reshaped = X_train_seq.reshape(X_train_seq.shape[0], -1)
-    X_val_reshaped = X_val_seq.reshape(X_val_seq.shape[0], -1)
-
-    X_train_resampled, y_train_resampled = smote.fit_resample(X_train_reshaped, y_train_seq)
-    X_val_resampled, y_val_resampled = smote.fit_resample(X_val_reshaped, y_val_seq)
-
-    # 将数据重新转换为序列格式
-    X_train_resampled = X_train_resampled.reshape(-1, sequence_length, X_seq.shape[2])
-    X_val_resampled = X_val_resampled.reshape(-1, sequence_length, X_seq.shape[2])
-
-    print(f"过采样后训练集序列形状: {X_train_resampled.shape}, 标签形状: {y_train_resampled.shape}")
-    print(f"过采样后验证集序列形状: {X_val_resampled.shape}, 标签形状: {y_val_resampled.shape}")
-
-    # 数据增强：镜像对称
-    def process_sample(i, X, y, le_fingering, le_hand, hand_index=2):
-        """
-        对第 i 个样本进行镜像对称数据增强处理。
-        如果样本为左手，则转换为右手，并翻转指法。
-        """
-        # 如果该样本的最后一个时间步的 hand_encoded 对应 'left'
-        if X[i, -1, hand_index] == le_hand.transform(['left'])[0]:
-            # 复制当前样本数据
-            X_mirror = X[i].copy()
-            # 将手部特征转换为右手
-            X_mirror[:, hand_index] = le_hand.transform(['right'])[0]
-            # 定义指法翻转规则（假设5个手指，1↔5, 2↔4, 3不变）
-            finger_flip = {0: 4, 1: 3, 2: 2, 3: 1, 4: 0}
-            # 翻转指法标签
-            y_mirror = np.array([finger_flip.get(f, f) for f in y[i]])
-            return X_mirror, y_mirror
-        else:
-            return None, None
-
-    def augment_mirror_symmetry_parallel(X, y, le_fingering, le_hand, hand_index=2, n_jobs=-1):
-        """
-        利用左右手镜像对称进行数据增强，采用并行计算。
-
-        参数:
-          - X: 原始序列数据，形状 (n_samples, seq_length, feature_dim)
-          - y: 对应标签，形状 (n_samples, )
-          - le_fingering, le_hand: 已训练的 LabelEncoder 对象
-          - hand_index: 在特征维度中，表示手部编码的位置
-          - n_jobs: 并行使用的作业数（-1 表示使用所有核）
-
-        返回:
-          - X_new, y_new: 增强后的数据（原始数据加上镜像增强数据）
-        """
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(process_sample)(i, X, y, le_fingering, le_hand, hand_index) for i in range(len(X))
-        )
-        # 过滤出不为 None 的结果
-        X_aug = [res[0] for res in results if res[0] is not None]
-        y_aug = [res[1] for res in results if res[1] is not None]
-
-        if X_aug:
-            X_aug = np.array(X_aug)
-            y_aug = np.array(y_aug)
-            X_new = np.concatenate((X, X_aug), axis=0)
-            y_new = np.concatenate((y, y_aug), axis=0)
-            return X_new, y_new
-        else:
-            return X, y
-
-    # 在您的数据增强部分替换原来的 augment_mirror_symmetry 函数调用：
-    X_train_aug, y_train_aug = augment_mirror_symmetry_parallel(X_train_resampled, y_train_resampled, le_fingering,
-                                                                le_hand, hand_index=2, n_jobs=-1)
-    X_val_aug, y_val_aug = augment_mirror_symmetry_parallel(X_val_resampled, y_val_resampled, le_fingering, le_hand,
-                                                            hand_index=2, n_jobs=-1)
-
-    print(f"增强后训练集序列形状: {X_train_aug.shape}, 标签形状: {y_train_aug.shape}")
-    print(f"增强后验证集序列形状: {X_val_aug.shape}, 标签形状: {y_val_aug.shape}")
-
-    # 将增强后的数据保存为 npy 文件
-    np.save('X_train_aug.npy', X_train_aug)
-    np.save('X_val_aug.npy', X_val_aug)
-    np.save('y_train_aug.npy', y_train_aug)
-    np.save('y_val_aug.npy', y_val_aug)
-
-    print("增强后的数据已保存。")
-
+    print("序列生成并保存完成")
 
 if __name__ == "__main__":
     main()
