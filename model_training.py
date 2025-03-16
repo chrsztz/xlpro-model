@@ -7,7 +7,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 import pickle
 from data_utils import load_pickle  # 用于加载 LabelEncoder
-from models import BiLSTMWithAttention  # 示例模型，可以替换为其他模型
+from models import BiLSTMWithAttention, CNNModel  # 示例模型，可以替换为其他模型
 from torch.cuda.amp import GradScaler, autocast
 
 
@@ -163,7 +163,8 @@ def main():
     print(f"模型参数 - input_size: {input_size}, hidden_size: {hidden_size}, num_classes: {num_classes}")
 
     # 初始化模型
-    model = BiLSTMWithAttention(input_size, hidden_size, num_layers, num_classes, dropout)
+    # model = BiLSTMWithAttention(input_size, hidden_size, num_layers, num_classes, dropout)
+    model = CNNModel(input_size, hidden_size, num_layers, num_classes, dropout)
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     model.to(device)

@@ -22,6 +22,70 @@ class TransformerModel(nn.Module):
         x = self.fc(x)  # [batch_size, num_classes]
         return x
 
+# CNN 模型
+class CNNModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout=0.3):
+        super(CNNModel, self).__init__()
+
+        # Keep the same parameters interface as BiLSTM for easy swapping
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.num_classes = num_classes
+        self.dropout = dropout
+
+        # CNN layers
+        self.conv_layers = nn.ModuleList()
+
+        # First conv layer takes input features
+        self.conv_layers.append(nn.Sequential(
+            nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.MaxPool1d(kernel_size=2, stride=1, padding=0)
+        ))
+
+        # Add additional conv layers based on num_layers
+        for i in range(1, num_layers):
+            channels = hidden_size * (2 if i > 1 else 1)
+            self.conv_layers.append(nn.Sequential(
+                nn.Conv1d(hidden_size, channels, kernel_size=3, padding=1),
+                nn.BatchNorm1d(channels),
+                nn.ReLU(),
+                nn.MaxPool1d(kernel_size=2, stride=1, padding=0)
+            ))
+            hidden_size = channels
+
+        # Global average pooling
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+
+        # Fully connected layers
+        self.fc = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, num_classes)
+        )
+
+    def forward(self, x):
+        # Input x shape: [batch, seq_len, features]
+        # Transpose for Conv1d: [batch, features, seq_len]
+        x = x.transpose(1, 2)
+
+        # Apply CNN layers
+        for conv in self.conv_layers:
+            x = conv(x)
+
+        # Global pooling
+        x = self.global_pool(x)  # Shape: [batch, channels, 1]
+        x = x.squeeze(-1)  # Shape: [batch, channels]
+
+        # Fully connected layers for classification
+        x = self.fc(x)
+
+        return x
+
 # BiLSTM 模型
 class BiLSTM(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout=0.5):
