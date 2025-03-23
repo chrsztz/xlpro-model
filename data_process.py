@@ -446,8 +446,8 @@ def main(sample_mode=False, sample_size=50000):
             # Store scaled features
             batch['fused_feature_scaled'] = list(fused_features_scaled)
 
-            # Combine features
-            batch = combine_features(batch, feature_columns)
+            # Combine features with ergonomic features
+            batch = combine_features(batch, feature_columns, include_ergonomic_features=True)
 
             batches.append(batch)
         except Exception as e:
@@ -457,14 +457,6 @@ def main(sample_mode=False, sample_size=50000):
 
         # Free memory
         gc.collect()
-
-        # Store scaled features
-        batch['fused_feature_scaled'] = list(fused_features_scaled)
-
-        # Combine features
-        batch = combine_features(batch, feature_columns)
-
-        batches.append(batch)
 
         # Free memory
         gc.collect()
@@ -507,8 +499,8 @@ def main(sample_mode=False, sample_size=50000):
             # Store scaled features
             batch['fused_feature_scaled'] = list(fused_features_scaled)
 
-            # Combine features
-            batch = combine_features(batch, feature_columns)
+            # Combine features with ergonomic features
+            batch = combine_features(batch, feature_columns, include_ergonomic_features=True)
 
             batches.append(batch)
         except Exception as e:

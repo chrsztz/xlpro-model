@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 # Transformer 模型
 class TransformerModel(nn.Module):
@@ -103,6 +104,70 @@ class BiLSTM(nn.Module):
         out = self.fc(final_feature)  # [batch_size, num_classes]
         return out
 
+
+class CNNBiLSTMAttention(nn.Module):
+    def __init__(self, input_size, cnn_channels, lstm_hidden_size, num_classes):
+        super().__init__()
+        # CNN特征提取模块
+        self.cnn = nn.Sequential(
+            nn.Conv1d(input_size, cnn_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(cnn_channels),
+            nn.GELU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(cnn_channels, cnn_channels * 2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(cnn_channels * 2),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(10)  # 动态调整序列长度
+        )
+
+        # BiLSTM时序建模
+        self.lstm = nn.LSTM(
+            input_size=cnn_channels * 2,
+            hidden_size=lstm_hidden_size,
+            bidirectional=True,
+            batch_first=True
+        )
+
+        # 注意力机制
+        self.attention = nn.MultiheadAttention(
+            embed_dim=lstm_hidden_size * 2,
+            num_heads=4,
+            dropout=0.3
+        )
+
+        # 分类头
+        self.classifier = nn.Sequential(
+            nn.Linear(lstm_hidden_size * 2, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        # 输入x形状: [batch_size, seq_len, input_size]
+
+        # CNN处理
+        x = x.permute(0, 2, 1)  # [batch, features, seq_len]
+        cnn_features = self.cnn(x)  # [batch, cnn_channels*2, 10]
+        cnn_features = cnn_features.permute(0, 2, 1)  # [batch, 10, cnn_channels*2]
+
+        # LSTM处理
+        lstm_out, _ = self.lstm(cnn_features)  # [batch, 10, lstm_hidden*2]
+
+        # 注意力聚合
+        attn_out, _ = self.attention(
+            lstm_out, lstm_out, lstm_out
+        )  # [batch, 10, lstm_hidden*2]
+
+        # 取最后时间步
+        final_feature = attn_out[:, -1, :]
+
+        # 分类
+
+        return self.classifier(final_feature)
+
+
 # BiGRU 模型
 class BiGRU(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout=0.5):
@@ -145,9 +210,6 @@ class Attention(nn.Module):
         return context
 
 # BiLSTM 与 Attention 结合的模型
-import torch.nn as nn
-import torch
-
 class BiLSTMWithAttention(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout, bidirectional=True):
         super(BiLSTMWithAttention, self).__init__()
@@ -178,7 +240,6 @@ class BiLSTMWithAttention(nn.Module):
         return output
 
 
-
 class AttentionMechanism(nn.Module):
     def __init__(self, lstm_output_size):
         super(AttentionMechanism, self).__init__()
@@ -199,4 +260,238 @@ class AttentionMechanism(nn.Module):
         context_vector = torch.sum(attn_weights.unsqueeze(-1) * lstm_out, dim=1)  # [batch_size, lstm_output_size]
         
         return context_vector, attn_weights
+
+
+# Positional Encoding for Transformer-based models
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x expected shape: [batch_size, seq_len, embedding_dim]
+        pos_encoding = self.pe[:x.size(1), :].transpose(0, 1)
+        x = x + pos_encoding
+        return self.dropout(x)
+
+
+# New Improved Model with Simplified Architecture and Hand-Specific Processing
+class ImprovedCNNBiLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_classes=10, dropout=0.3):
+        super().__init__()
+        
+        # Layer normalization for input stabilization
+        self.input_norm = nn.LayerNorm(input_size)
+        
+        # CNN for local pattern extraction - simpler architecture
+        self.cnn_layers = nn.Sequential(
+            # First CNN block - extract simple patterns
+            nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            # Second CNN block - more complex patterns
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # BiLSTM for sequential modeling
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=2,
+            bidirectional=True,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Simple attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size * 2, 1),
+            nn.Sigmoid()
+        )
+        
+        # Classification layers with skip connection
+        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, num_classes)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, hand_indices=None):
+        batch_size, seq_len, features = x.size()
+        
+        # Normalize input for stable training
+        x = self.input_norm(x)
+        
+        # CNN feature extraction
+        x_cnn = x.transpose(1, 2)  # [batch, features, seq_len]
+        x_cnn = self.cnn_layers(x_cnn)
+        x_cnn = x_cnn.transpose(1, 2)  # [batch, seq_len, hidden]
+        
+        # Hand-specific adjustment if hand indices provided
+        if hand_indices is not None:
+            # Get hand information from the specified index
+            if isinstance(hand_indices, int):
+                hand_feature = x[:, -1, hand_indices].unsqueeze(1).unsqueeze(2)  # [batch, 1, 1]
+                # Adjust channel importance based on hand (simple attention)
+                hand_weight = torch.sigmoid(hand_feature)
+                # Broadcast properly to match x_cnn dimensions [batch, seq_len, hidden]
+                hand_weight = hand_weight.expand(-1, x_cnn.size(1), 1)
+                x_cnn = x_cnn * (1.0 + 0.5 * hand_weight)
+        
+        # BiLSTM processing
+        lstm_out, _ = self.lstm(x_cnn)  # [batch, seq, hidden*2]
+        
+        # Simple attention mechanism
+        attn_scores = self.attention(lstm_out)  # [batch, seq, 1]
+        attn_weights = attn_scores / (attn_scores.sum(dim=1, keepdim=True) + 1e-8)  # Add epsilon for numerical stability
+        context = torch.bmm(attn_weights.transpose(1, 2), lstm_out)  # [batch, 1, hidden*2]
+        context = context.squeeze(1)  # [batch, hidden*2]
+        
+        # Classification with skip connection for better gradient flow
+        out = self.fc1(context)
+        out = F.relu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        
+        # Store attention weights for visualization
+        self.last_attention_weights = attn_weights.detach()
+        
+        return out
+
+# New Hierarchical Attention Fingering Model
+class HierarchicalAttentionFingeringModel(nn.Module):
+    def __init__(self, input_size, num_classes, hidden_size=256, num_heads=4, 
+                 dropout=0.3, num_layers=3):
+        super().__init__()
+        
+        # Embedding layer
+        self.input_embedding = nn.Linear(input_size, hidden_size)
+        
+        # Local context modeling with CNN
+        self.local_context = nn.Sequential(
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.GELU(),
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_size),
+            nn.GELU(),
+        )
+        
+        # Sequential context with Transformer
+        self.pos_encoder = PositionalEncoding(hidden_size, dropout)
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=hidden_size, 
+            nhead=num_heads,
+            dim_feedforward=hidden_size*4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layers, 
+            num_layers=num_layers
+        )
+        
+        # Hierarchical attention
+        self.note_attention = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Hand-specific processing
+        self.hand_gate = nn.Linear(hidden_size, 2)  # Gate for left/right hand features
+        self.hand_specific_left = nn.Linear(hidden_size, hidden_size//2)
+        self.hand_specific_right = nn.Linear(hidden_size, hidden_size//2)
+        
+        # Ergonomic constraints layer
+        self.ergonomic_layer = nn.Linear(hidden_size, hidden_size)
+        
+        # Output layer
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size//2),
+            nn.LayerNorm(hidden_size//2),
+            nn.Dropout(dropout),
+            nn.GELU(),
+            nn.Linear(hidden_size//2, num_classes)
+        )
+        
+    def forward(self, x, hand_indices=None):
+        # x shape: [batch_size, seq_len, features]
+        
+        # Initial embedding
+        x = self.input_embedding(x)  # [batch, seq_len, hidden_size]
+        
+        # Local context with CNN
+        local_x = x.transpose(1, 2)  # [batch, hidden_size, seq_len]
+        local_x = self.local_context(local_x)
+        local_x = local_x.transpose(1, 2)  # [batch, seq_len, hidden_size]
+        
+        # Add positional encoding
+        x = self.pos_encoder(local_x)
+        
+        # Transformer for sequential context
+        x = self.transformer_encoder(x)
+        
+        # Note-level attention
+        attn_output, _ = self.note_attention(x, x, x)
+        
+        # Hand-specific processing
+        # Assume hand_indices=2 (index of hand feature in input)
+        if hand_indices is not None:
+            # Extract hand information (assuming normalized to 0=left, 1=right)
+            hand_info = torch.zeros((x.size(0), x.size(1), 2), device=x.device)
+            
+            # Check if hand_indices is a batch of indices
+            if isinstance(hand_indices, torch.Tensor) and hand_indices.dim() > 0:
+                for i, idx in enumerate(hand_indices):
+                    hand_val = x[i, -1, idx].item()  # Use last timestep's hand info
+                    # Set left or right gate based on hand value
+                    if hand_val < 0.5:  # Assuming left hand is encoded as 0
+                        hand_info[i, :, 0] = 1.0  # Activate left hand gate
+                    else:
+                        hand_info[i, :, 1] = 1.0  # Activate right hand gate
+            else:
+                # Use a fixed index for the entire batch
+                for i in range(x.size(0)):
+                    hand_val = x[i, -1, hand_indices].item()
+                    if hand_val < 0.5:
+                        hand_info[i, :, 0] = 1.0
+                    else:
+                        hand_info[i, :, 1] = 1.0
+            
+            # Process the hand gating information
+            hand_gates = torch.sigmoid(self.hand_gate(x))
+            # Override with our hand info where available
+            hand_gates = hand_gates + hand_info
+            
+            # Process separately for each hand
+            left_features = self.hand_specific_left(x) * hand_gates[:, :, 0].unsqueeze(-1)
+            right_features = self.hand_specific_right(x) * hand_gates[:, :, 1].unsqueeze(-1)
+            
+            # Combine hand-specific features
+            combined_features = torch.cat([left_features, right_features], dim=-1)
+        else:
+            combined_features = x
+            
+        # Ergonomic constraints
+        x = self.ergonomic_layer(combined_features)
+        x = F.gelu(x + attn_output)  # Residual connection
+        
+        # Final classification - predict for each position in the sequence
+        predictions = self.classifier(x)
+        
+        return predictions
 

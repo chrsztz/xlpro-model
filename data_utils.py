@@ -453,8 +453,9 @@ def get_fused_features(df, word2vec_model, tokenized_sentences):
     return df
 
 
-def combine_features(df, feature_columns):
-    """将融合特征与原始特征组合，确保总维度为136（基础特征8维 + 融合特征128维）。
+def combine_features(df, feature_columns, include_ergonomic_features=True):
+    """将融合特征与原始特征组合，并添加人体工程学特征。
+    总维度为144（基础特征8维 + 融合特征128维 + 人体工程学特征8维）。
     内存优化版本：按小批次处理，使用低精度数据类型。
     """
     # Process in very small batches to save memory
@@ -484,14 +485,23 @@ def combine_features(df, feature_columns):
         # Get fused features and convert to float32
         fused_features = np.stack(batch['fused_feature_scaled'].values).astype(np.float32)
 
-        # Combine with lower precision
-        combined = np.concatenate([base_features, fused_features], axis=1)
+        # Compute ergonomic features if requested
+        if include_ergonomic_features:
+            ergo_features = compute_ergonomic_features(batch)
+            # Combine all features
+            combined = np.concatenate([base_features, fused_features, ergo_features], axis=1)
+        else:
+            # Combine only base and fused features
+            combined = np.concatenate([base_features, fused_features], axis=1)
 
         # Store as list
         all_combined.extend(list(combined))
 
         # Clean up to free memory
-        del base_features, fused_features, combined
+        if include_ergonomic_features:
+            del base_features, fused_features, ergo_features, combined
+        else:
+            del base_features, fused_features, combined
         gc.collect()
 
     # Store combined features
@@ -500,10 +510,137 @@ def combine_features(df, feature_columns):
 
     # Verify dimension
     sample_dim = len(df['combined_features'].iloc[0])
+    expected_dim = 144 if include_ergonomic_features else 136
     print(f"Combined feature dimension: {sample_dim}")
-    assert sample_dim == 136, f"Expected 136 features, got {sample_dim}"
+    assert sample_dim == expected_dim, f"Expected {expected_dim} features, got {sample_dim}"
 
     return df
+
+
+def compute_ergonomic_features(df):
+    """
+    计算人体工程学特征。
+    这些特征专门用于捕捉钢琴指法的特殊性质和手指转换的难度。
+    
+    返回一个包含以下特征的数组：
+    1. 手指跨度（当前音符和前一个音符的音高差的绝对值，由同一只手弹奏）
+    2. 手指转换代价（根据手指ID之间的转换计算）
+    3. 和弦指法复杂度（包含和弦时的指法组合的复杂性）
+    4. 前后音符持续时间比率（节奏变化特征）
+    5. 黑白键转换代价（从黑键到白键或白键到黑键的转换）
+    6. 音符密度与手指疲劳相关性
+    7. 先前同指法使用次数（同一指法被连续使用的次数）
+    8. 手臂位置移动代价（大幅度位置变化的代价）
+    """
+    # 获取样本数量
+    n_samples = len(df)
+    
+    # 初始化为零的特征矩阵 (8个人体工程学特征)
+    ergonomic_features = np.zeros((n_samples, 8), dtype=np.float32)
+    
+    # 如果需要的列不存在，则返回零矩阵
+    required_cols = ['midi_number', 'hand_encoded', 'finger_number', 'black_key']
+    if not all(col in df.columns for col in required_cols):
+        print("Warning: Missing required columns for ergonomic features, using zeros")
+        return ergonomic_features
+    
+    # 提取数据为numpy数组，提高计算速度
+    midi_nums = df['midi_number'].values
+    hand_encoded = df['hand_encoded'].values
+    finger_nums = df['finger_number'].values if 'finger_number' in df.columns else np.zeros(n_samples)
+    black_keys = df['black_key'].values if 'black_key' in df.columns else np.zeros(n_samples)
+    durations = df['duration'].values if 'duration' in df.columns else np.ones(n_samples)
+    is_chord = df['chord'].values if 'chord' in df.columns else np.zeros(n_samples)
+    
+    # 1. 手指跨度
+    for i in range(1, n_samples):
+        if hand_encoded[i] == hand_encoded[i-1]:  # 同一只手
+            # 计算音高差绝对值，并归一化
+            pitch_diff = abs(midi_nums[i] - midi_nums[i-1])
+            # 跨度转换为物理距离感受度（0-24半音跨度，归一化为0-1）
+            ergonomic_features[i, 0] = min(pitch_diff / 24.0, 1.0)
+    
+    # 2. 手指转换代价
+    # 定义手指转换代价矩阵（基于钢琴指法理论）
+    # 行和列对应指法编码：1,2,3,4,5 (右手) 或 -5,-4,-3,-2,-1 (左手)
+    finger_transition_cost = {
+        # 右手指法转换代价（1=拇指，2=食指，...，5=小指）
+        1: {1: 0.0, 2: 0.2, 3: 0.3, 4: 0.4, 5: 0.5},
+        2: {1: 0.2, 2: 0.0, 3: 0.1, 4: 0.2, 5: 0.3},
+        3: {1: 0.3, 2: 0.1, 3: 0.0, 4: 0.1, 5: 0.2},
+        4: {1: 0.4, 2: 0.2, 3: 0.1, 4: 0.0, 5: 0.1},
+        5: {1: 0.5, 2: 0.3, 3: 0.2, 4: 0.1, 5: 0.0},
+        # 左手指法转换代价（-5=小指，-4=无名指，...，-1=拇指）
+        -5: {-5: 0.0, -4: 0.1, -3: 0.2, -2: 0.3, -1: 0.5},
+        -4: {-5: 0.1, -4: 0.0, -3: 0.1, -2: 0.2, -1: 0.4},
+        -3: {-5: 0.2, -4: 0.1, -3: 0.0, -2: 0.1, -1: 0.3},
+        -2: {-5: 0.3, -4: 0.2, -3: 0.1, -2: 0.0, -1: 0.2},
+        -1: {-5: 0.5, -4: 0.4, -3: 0.3, -2: 0.2, -1: 0.0},
+    }
+    
+    for i in range(1, n_samples):
+        if hand_encoded[i] == hand_encoded[i-1] and finger_nums[i] != 0 and finger_nums[i-1] != 0:
+            # 获取前后指法
+            prev_finger = finger_nums[i-1]
+            curr_finger = finger_nums[i]
+            
+            # 如果在转换代价矩阵中存在则获取代价，否则给予较大代价
+            if prev_finger in finger_transition_cost and curr_finger in finger_transition_cost[prev_finger]:
+                ergonomic_features[i, 1] = finger_transition_cost[prev_finger][curr_finger]
+            else:
+                ergonomic_features[i, 1] = 0.5  # 默认中等代价
+    
+    # 3. 和弦指法复杂度
+    for i in range(n_samples):
+        if is_chord[i] > 0:
+            # 对和弦音符赋予较高的指法复杂度
+            ergonomic_features[i, 2] = 0.8
+    
+    # 4. 前后音符持续时间比率
+    for i in range(1, n_samples):
+        if durations[i-1] > 0:
+            # 计算当前音符与前一个音符的持续时间比率
+            duration_ratio = durations[i] / durations[i-1]
+            # 将比率归一化到[0,1]范围，限制极端值
+            ergonomic_features[i, 3] = min(1.0, abs(1.0 - duration_ratio) / 2.0)
+    
+    # 5. 黑白键转换代价
+    for i in range(1, n_samples):
+        if hand_encoded[i] == hand_encoded[i-1]:
+            # 黑键到白键或白键到黑键的转换
+            if black_keys[i] != black_keys[i-1]:
+                ergonomic_features[i, 4] = 0.3  # 中等转换代价
+    
+    # 6. 音符密度与手指疲劳相关性
+    # 使用之前计算的note_density特征（如果存在）
+    if 'note_density' in df.columns:
+        densities = df['note_density'].values
+        for i in range(n_samples):
+            # 归一化密度值（将密度值映射到[0,1]范围）
+            # 假设最大密度为20个音符/秒
+            ergonomic_features[i, 5] = min(densities[i] / 20.0, 1.0)
+    
+    # 7. 先前同指法使用次数
+    finger_count = {}  # 跟踪每个手指使用次数
+    for i in range(n_samples):
+        hand_finger_key = (hand_encoded[i], finger_nums[i])
+        if hand_finger_key not in finger_count:
+            finger_count[hand_finger_key] = 0
+        
+        finger_count[hand_finger_key] += 1
+        # 归一化使用次数：多次使用同一指法会增加疲劳
+        ergonomic_features[i, 6] = min((finger_count[hand_finger_key] - 1) / 10.0, 1.0)
+    
+    # 8. 手臂位置移动代价
+    for i in range(1, n_samples):
+        if hand_encoded[i] == hand_encoded[i-1]:
+            # 大幅度位置变化（大于8个半音）增加代价
+            position_change = abs(midi_nums[i] - midi_nums[i-1])
+            if position_change > 8:
+                # 归一化位置变化代价
+                ergonomic_features[i, 7] = min(position_change / 24.0, 1.0)
+    
+    return ergonomic_features
 
 
 def process_fused_features(df, scaler_fused=None, batch_size=10000):
