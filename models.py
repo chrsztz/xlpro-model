@@ -495,3 +495,64 @@ class HierarchicalAttentionFingeringModel(nn.Module):
         
         return predictions
 
+# New Enhanced Model combining CNN, BiLSTM, and Attention
+class EnhancedBiLSTMWithAttention(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout=0.3):
+        super(EnhancedBiLSTMWithAttention, self).__init__()
+        
+        # Input normalization for stability
+        self.input_norm = nn.LayerNorm(input_size)
+        
+        # CNN layers for local pattern extraction (from ImprovedCNNBiLSTM)
+        self.cnn_layers = nn.Sequential(
+            # First CNN block - extract simple patterns
+            nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            
+            # Second CNN block - more complex patterns
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # BiLSTM from original model
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            bidirectional=True,
+            batch_first=True
+        )
+        
+        # Attention layer (using the original attention mechanism)
+        self.attention = AttentionMechanism(hidden_size * 2)
+        
+        # Classification layer
+        self.fc = nn.Linear(hidden_size * 2, num_classes)
+        
+    def forward(self, x):
+        batch_size, seq_len, features = x.size()
+        
+        # Normalize input
+        x = self.input_norm(x)
+        
+        # CNN processing
+        x_cnn = x.transpose(1, 2)  # [batch, features, seq_len]
+        x_cnn = self.cnn_layers(x_cnn)
+        x_cnn = x_cnn.transpose(1, 2)  # [batch, seq_len, hidden]
+        
+        # BiLSTM processing
+        lstm_out, _ = self.lstm(x_cnn)  # [batch, seq_len, hidden*2]
+        
+        # Attention mechanism
+        context_vector, _ = self.attention(lstm_out)  # [batch, hidden*2]
+        
+        # Classification
+        output = self.fc(context_vector)
+        
+        return output
+

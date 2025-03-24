@@ -1,56 +1,45 @@
+# model_training.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
-from tqdm import tqdm
 import pickle
 import os
-from data_utils import load_pickle  # 用于加载 LabelEncoder
-from models import HierarchicalAttentionFingeringModel  # 新添加的模型
-from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm 
+from data_utils import load_pickle
+from models import TransformerModel,BiGRU,BiLSTM,BiLSTMWithAttention
 
-
-# Weighted Focal Loss 定义，用于处理类别不平衡和难分类样本
-class WeightedFocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2, reduction='mean', ignore_index=10):
-        super(WeightedFocalLoss, self).__init__()
+# 定义改进的 Focal Loss
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2, reduction='mean', label_smoothing=0.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
-        self.ignore_index = ignore_index
-        self.alpha = alpha  # 类别权重
+        self.label_smoothing = label_smoothing  # 添加标签平滑
 
     def forward(self, inputs, targets):
-        # 创建忽略标签的掩码
-        mask = targets != self.ignore_index
-        inputs_masked = inputs[mask]
-        targets_masked = targets[mask]
-        
-        if inputs_masked.size(0) == 0:
-            return torch.tensor(0.0, device=inputs.device)
-
-        # 计算带权重的交叉熵损失
-        if self.alpha is not None:
-            # 确保alpha是一个与输入设备相同的张量
-            if isinstance(self.alpha, torch.Tensor):
-                alpha = self.alpha.to(inputs.device)
-            else:
-                alpha = torch.tensor(self.alpha, device=inputs.device)
-                
-            # 获取每个样本对应的权重
-            batch_alpha = alpha.gather(0, targets_masked)
-            BCE_loss = F.cross_entropy(inputs_masked, targets_masked, reduction='none')
-            pt = torch.exp(-BCE_loss)
-            
-            # 应用Focal Loss公式
-            F_loss = batch_alpha * (1 - pt) ** self.gamma * BCE_loss
+        # 应用标签平滑
+        if self.label_smoothing > 0:
+            num_classes = inputs.size(-1)
+            smooth_targets = torch.zeros_like(inputs).scatter_(
+                1, targets.unsqueeze(1), 1.0
+            )
+            smooth_targets = smooth_targets * (1 - self.label_smoothing) + self.label_smoothing / num_classes
+            BCE_loss = -torch.sum(smooth_targets * F.log_softmax(inputs, dim=1), dim=1)
         else:
-            BCE_loss = F.cross_entropy(inputs_masked, targets_masked, reduction='none')
-            pt = torch.exp(-BCE_loss)
-            F_loss = (1 - pt) ** self.gamma * BCE_loss
+            BCE_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        
+        pt = torch.exp(-BCE_loss)
+        F_loss = (1 - pt) ** self.gamma * BCE_loss
 
-        # 根据reduction参数返回结果
         if self.reduction == 'mean':
             return F_loss.mean()
         elif self.reduction == 'sum':
@@ -58,496 +47,609 @@ class WeightedFocalLoss(nn.Module):
         else:
             return F_loss
 
+# 定义新的 CNN 模型
+class CNNWithAttention(nn.Module):
+    def __init__(self, input_size, hidden_size, num_classes, dropout=0.5):
+        super(CNNWithAttention, self).__init__()
+        
+        # 输入标准化
+        self.input_norm = nn.LayerNorm(input_size)
+        
+        # CNN架构 - 使用不同大小的卷积核捕获不同尺度的特征
+        self.conv1 = nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(input_size, hidden_size, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(input_size, hidden_size, kernel_size=7, padding=3)
+        
+        # 批量归一化 - 加速训练并提高稳定性
+        self.bn1 = nn.BatchNorm1d(hidden_size)
+        self.bn2 = nn.BatchNorm1d(hidden_size)
+        self.bn3 = nn.BatchNorm1d(hidden_size)
+        
+        # 注意力层 - 增强对序列中重要部分的关注
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # 输出层
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(hidden_size // 2, num_classes)
+        )
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
-# 增强的Dataset类，支持复杂的数据增强
-class EnhancedFingeringDataset(Dataset):
-    def __init__(self, X, y, le_hand, hand_index=2, mirror_prob=0.5, 
-                 transpose_prob=0.2, transpose_range=(-2, 2), 
-                 noise_prob=0.1, noise_level=0.02):
-        self.X = X
-        self.y = y
-        self.le_hand = le_hand
-        self.hand_index = hand_index
-        self.mirror_prob = mirror_prob
-        self.transpose_prob = transpose_prob
-        self.transpose_range = transpose_range
-        self.noise_prob = noise_prob
-        self.noise_level = noise_level
+    def forward(self, x):
+        # 输入形状: [batch_size, seq_length, input_size]
+        batch_size, seq_len, features = x.size()
+        
+        # 应用输入标准化
+        x = self.input_norm(x)
+        
+        # 转换为卷积所需的形状
+        x_conv = x.transpose(1, 2)  # [batch_size, input_size, seq_length]
+        
+        # 应用不同尺度的卷积
+        conv1_out = F.relu(self.bn1(self.conv1(x_conv)))  # [batch_size, hidden_size, seq_length]
+        conv2_out = F.relu(self.bn2(self.conv2(x_conv)))
+        conv3_out = F.relu(self.bn3(self.conv3(x_conv)))
+        
+        # 转回序列形式
+        conv1_out = conv1_out.transpose(1, 2)  # [batch_size, seq_length, hidden_size]
+        conv2_out = conv2_out.transpose(1, 2)
+        conv3_out = conv3_out.transpose(1, 2)
+        
+        # 组合不同尺度的卷积特征
+        conv_cat = torch.cat([conv1_out, conv2_out, conv3_out], dim=2)  # [batch_size, seq_length, hidden_size*3]
+        
+        # 应用注意力机制
+        attn_weights = self.attention(conv_cat)  # [batch_size, seq_length, 1]
+        attn_weights = F.softmax(attn_weights, dim=1)
+        context = torch.sum(attn_weights * conv_cat, dim=1)  # [batch_size, hidden_size*3]
+        
+        # 输出分类结果
+        output = self.fc(context)
+        
+        return output
 
-        # 打印形状信息以便调试
-        print(f"X shape: {self.X.shape}, y shape: {self.y.shape}")
-        print(f"X dtype: {self.X.dtype}, y dtype: {self.y.dtype}")
-        print(f"Sample X[0] shape: {self.X[0].shape}, y[0]: {self.y[0]}")
-
-        # 计算类别分布，用于后续加权采样
-        self.class_counts = np.bincount(self.y[self.y != 10], minlength=10)
-        print(f"Class distribution: {self.class_counts}")
+# 定义 Dataset
+class FingeringDataset(torch.utils.data.Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)  # 输入特征
+        self.y = torch.tensor(y, dtype=torch.long)  # 指法标签
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        X_sample = self.X[idx].copy()
-        y_sample = int(self.y[idx])  # 将y_sample转换为整数，因为它是一个单一的标签值
+        return self.X[idx], self.y[idx]
 
-        # 1. 镜像增强
-        if np.random.rand() < self.mirror_prob:
-            # 检查最后一个时间步的手属性
-            if X_sample[-1, self.hand_index] == self.le_hand.transform(['left'])[0]:
-                # 将所有时间步的手属性改为右手
-                X_sample[:, self.hand_index] = self.le_hand.transform(['right'])[0]
-            else:
-                # 将所有时间步的手属性改为左手
-                X_sample[:, self.hand_index] = self.le_hand.transform(['left'])[0]
-
-            # 指法翻转规则 - 直接应用到单一的标签值
-            finger_flip = {0: 4, 1: 3, 2: 2, 3: 1, 4: 0, 5: 9, 6: 8, 7: 7, 8: 6, 9: 5}
-            y_sample = finger_flip.get(y_sample, y_sample)
-
-        # 2. 音符平移（模拟移调）- 不会影响指法
-        if np.random.rand() < self.transpose_prob and y_sample != 10:
-            # 通常钢琴音符在MIDI中是以midi_number表示
-            # 假设X的第一个特征是音高特征，适当修改索引
-            pitch_index = 0  # 修改为实际音高特征的索引
-            transpose_amount = np.random.randint(
-                self.transpose_range[0], self.transpose_range[1] + 1)
-            
-            # 对所有时间步的音高应用平移
-            X_sample[:, pitch_index] = X_sample[:, pitch_index] + transpose_amount
-            
-            # 确保音高保持在合理范围内（例如MIDI音符范围21-108）
-            X_sample[:, pitch_index] = np.clip(X_sample[:, pitch_index], 21, 108)
-
-        # 3. 添加随机噪声
-        if np.random.rand() < self.noise_prob and y_sample != 10:
-            # 对除了分类特征（如手、指法）之外的所有特征添加噪声
-            # 假设最后几列是分类特征，前面的是数值特征
-            numeric_features = list(range(X_sample.shape[1]))
-            numeric_features.remove(self.hand_index)  # 移除手部特征索引
-            
-            # 添加高斯噪声
-            noise = np.random.normal(0, self.noise_level, size=(X_sample.shape[0], len(numeric_features)))
-            X_sample[:, numeric_features] += noise
-
-        # 返回转换为张量的样本
-        return torch.tensor(X_sample, dtype=torch.float32), torch.tensor(y_sample, dtype=torch.long)
-
-    def get_sample_weights(self):
-        """获取每个样本的权重，用于加权采样"""
-        weights = np.ones(len(self.y))
-        for i, y_val in enumerate(self.y):
-            if y_val != 10:  # 忽略未标注的样本
-                # 根据类别频率的倒数计算权重
-                weights[i] = 1.0 / self.class_counts[y_val]
-                
-        # 归一化权重
-        if weights.sum() > 0:
-            weights = weights / weights.sum() * len(weights)
-        return weights
-
-
-def train_epoch(model, loader, criterion, optimizer, device, use_amp=False):
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    scaler = GradScaler() if use_amp else None
-    
-    for X_batch, y_batch in tqdm(loader, desc="Training"):
-        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        optimizer.zero_grad()
-        
-        if use_amp:
-            with autocast():
-                # 这里假设hand_index=2，实际情况可能需要调整
-                outputs = model(X_batch, hand_indices=2)
-                if outputs.dim() > 2:  # 如果模型返回序列预测，取最后一个时间步
-                    outputs = outputs[:, -1, :]
-                loss = criterion(outputs, y_batch)
-            
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            outputs = model(X_batch, hand_indices=2)
-            if outputs.dim() > 2:  # 如果模型返回序列预测，取最后一个时间步
-                outputs = outputs[:, -1, :]
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-        
-        total_loss += loss.item()
-        
-        # 计算准确率
-        mask = y_batch != 10  # 忽略未标注样本
-        if mask.sum() > 0:
-            _, predicted = torch.max(outputs[mask], 1)
-            total += mask.sum().item()
-            correct += (predicted == y_batch[mask]).sum().item()
-    
-    avg_loss = total_loss / len(loader)
-    accuracy = correct / total if total > 0 else 0
-    return avg_loss, accuracy
-
-
-def evaluate(model, loader, criterion, device):
+# 评估模型性能
+def evaluate_model(model, data_loader, criterion, device):
     model.eval()
-    total_loss = 0
-    correct = 0
-    total = 0
-    all_predictions = []
-    all_targets = []
+    val_loss = 0
+    all_labels = []
+    all_preds = []
     
     with torch.no_grad():
-        for X_batch, y_batch in loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            outputs = model(X_batch, hand_indices=2)
+        for X_batch, y_batch in tqdm(data_loader, desc="Evaluation", leave=False):
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
             
-            if outputs.dim() > 2:  # 如果模型返回序列预测，取最后一个时间步
-                outputs = outputs[:, -1, :]
-                
+            outputs = model(X_batch)
             loss = criterion(outputs, y_batch)
-            total_loss += loss.item()
+            val_loss += loss.item() * X_batch.size(0)
             
-            # 只评估有标注的样本
-            mask = y_batch != 10
-            if mask.sum() > 0:
-                _, predicted = torch.max(outputs[mask], 1)
-                total += mask.sum().item()
-                correct += (predicted == y_batch[mask]).sum().item()
-                
-                # 收集预测结果和标签，用于详细分析
-                all_predictions.append(predicted.cpu().numpy())
-                all_targets.append(y_batch[mask].cpu().numpy())
+            _, preds = torch.max(outputs, 1)
+            all_labels.extend(y_batch.cpu().numpy())
+            all_preds.extend(preds.cpu().numpy())
     
-    avg_loss = total_loss / len(loader)
-    accuracy = correct / total if total > 0 else 0
+    val_loss /= len(data_loader.dataset)
     
-    # 合并所有预测结果和标签
-    if all_predictions:
-        all_predictions = np.concatenate(all_predictions)
-        all_targets = np.concatenate(all_targets)
-        
-        # 计算每个类别的准确率
-        class_accuracies = []
-        for cls in range(10):  # 假设有10个类别
-            mask = all_targets == cls
-            if mask.sum() > 0:
-                cls_acc = (all_predictions[mask] == cls).mean()
-                class_accuracies.append(cls_acc)
-            else:
-                class_accuracies.append(0.0)
-        
-        return avg_loss, accuracy, class_accuracies
-    else:
-        return avg_loss, accuracy, [0.0] * 10
+    # 计算总体准确率
+    correct = sum(1 for p, t in zip(all_preds, all_labels) if p == t)
+    accuracy = correct / len(all_labels)
+    
+    # 计算每个类别的准确率
+    conf_matrix = confusion_matrix(all_labels, all_preds)
+    class_accuracies = conf_matrix.diagonal() / conf_matrix.sum(axis=1)
+    
+    return val_loss, accuracy, class_accuracies, conf_matrix, all_preds, all_labels
 
+# 修改 train_epoch 函数以支持 OneCycleLR 调度器
+def train_epoch(model, train_loader, optimizer, criterion, device, clip_value=1.0):
+    model.train()
+    train_loss = 0
+    all_labels = []
+    all_preds = []
+    grad_norms = []
+    
+    for X_batch, y_batch in tqdm(train_loader, desc="Training", leave=False):
+        X_batch = X_batch.to(device)
+        y_batch = y_batch.to(device)
+        
+        # 前向传播
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        
+        # 反向传播
+        loss.backward()
+        
+        # 计算梯度范数（用于监控梯度）
+        total_norm = 0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.detach().data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        grad_norms.append(total_norm)
+        
+        # 梯度裁剪防止梯度爆炸
+        if clip_value > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
+        
+        optimizer.step()
+        
+        # 更新学习率 - 批次级别更新
+        if isinstance(optimizer.param_groups[0]['lr'], torch.optim.lr_scheduler.OneCycleLR):
+            scheduler.step()
+        
+        train_loss += loss.item() * X_batch.size(0)
+        
+        # 记录预测结果
+        _, preds = torch.max(outputs, 1)
+        all_labels.extend(y_batch.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+        
+        # 计算当前批次每个类别的准确率
+        batch_labels = y_batch.cpu().numpy()
+        batch_preds = preds.cpu().numpy()
+        
+        # 每100个批次检查一次类别分布
+        if len(all_preds) % (100 * X_batch.size(0)) == 0:
+            # 计算目前为止的类别分布
+            pred_counts = np.bincount(all_preds[-1000:] if len(all_preds) > 1000 else all_preds, 
+                                      minlength=len(np.unique(all_labels)))
+            
+            # 如果预测严重偏向某些类别（大于70%），则警告
+            max_pred_class = np.argmax(pred_counts)
+            max_pred_ratio = pred_counts[max_pred_class] / pred_counts.sum()
+            
+            print(f"当前预测类别分布: {pred_counts}, 梯度范数: {np.mean(grad_norms):.4f}")
+            
+            if max_pred_ratio > 0.7:
+                print(f"警告: 检测到模式崩溃 - 类别 {max_pred_class} 占比 {max_pred_ratio:.4f}")
+                
+                # 检查损失值是否异常
+                if not np.isfinite(loss.item()):
+                    print(f"警告: 损失值异常 ({loss.item()})")
+                
+                # 检查梯度是否异常
+                if np.mean(grad_norms) > 10 or np.mean(grad_norms) < 1e-6:
+                    print(f"警告: 梯度范数异常 ({np.mean(grad_norms):.4f})")
+            
+            # 重置梯度范数列表避免内存过大
+            grad_norms = []
+    
+    train_loss /= len(train_loader.dataset)
+    
+    # 计算训练准确率
+    correct = sum(1 for p, t in zip(all_preds, all_labels) if p == t)
+    accuracy = correct / len(all_labels)
+    
+    # 计算每个类别的准确率
+    class_accs = []
+    unique_classes = np.unique(all_labels)
+    for cls in unique_classes:
+        cls_indices = [i for i, l in enumerate(all_labels) if l == cls]
+        if cls_indices:
+            cls_correct = sum(1 for i in cls_indices if all_preds[i] == all_labels[i])
+            cls_acc = cls_correct / len(cls_indices)
+            class_accs.append((cls, cls_acc))
+    
+    # 排序并输出每个类别的准确率
+    class_accs.sort(key=lambda x: x[0])
+    for cls, acc in class_accs:
+        print(f"  类别 {cls} 训练准确率: {acc:.4f}")
+    
+    return train_loss, accuracy, all_preds, all_labels
+
+# 可视化训练历史
+def plot_training_history(history, save_path='results'):
+    plt.figure(figsize=(15, 10))
+    
+    # 绘制损失曲线
+    plt.subplot(2, 2, 1)
+    plt.plot(history['train_loss'], label='Train Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title('Loss Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    # 绘制准确率曲线
+    plt.subplot(2, 2, 2)
+    plt.plot(history['train_acc'], label='Train Accuracy')
+    plt.plot(history['val_acc'], label='Validation Accuracy')
+    plt.title('Accuracy Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    
+    # 绘制学习率曲线
+    plt.subplot(2, 2, 3)
+    plt.plot(history['learning_rates'])
+    plt.title('Learning Rate Over Time')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    
+    # 绘制每个类别的最终准确率
+    plt.subplot(2, 2, 4)
+    class_accs = history['class_accs'][-1]
+    plt.bar(range(len(class_accs)), class_accs)
+    plt.title('Per-Class Accuracy (Final)')
+    plt.xlabel('Class')
+    plt.ylabel('Accuracy')
+    plt.xticks(range(len(class_accs)))
+    
+    plt.tight_layout()
+    os.makedirs(save_path, exist_ok=True)
+    plt.savefig(f'{save_path}/training_history.png')
+    plt.close()
+
+# 绘制混淆矩阵
+def plot_confusion_matrix(conf_matrix, save_path='results'):
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    
+    os.makedirs(save_path, exist_ok=True)
+    plt.savefig(f'{save_path}/confusion_matrix.png')
+    plt.close()
 
 def main():
-    # 数据路径
-    train_X_path = 'X_train_combined.npy'
-    train_y_path = 'y_train_combined.npy'
-    val_X_path = 'X_val_combined.npy'
-    val_y_path = 'y_val_combined.npy'
-
-    # 打印数据信息
-    print(f"加载训练和验证数据...")
-
+    # 设置随机种子确保结果可重复
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    
+    # 创建结果目录
+    results_dir = 'results_cnn'
+    os.makedirs(results_dir, exist_ok=True)
+    
     # 加载数据
-    X_train = np.load(train_X_path, mmap_mode='r')
-    y_train = np.load(train_y_path, mmap_mode='r')
-    X_val = np.load(val_X_path, mmap_mode='r')
-    y_val = np.load(val_y_path, mmap_mode='r')
-
-    print(f"数据加载完成。X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
-    print(f"X_val shape: {X_val.shape}, y_val shape: {y_val.shape}")
-
-    # 加载 LabelEncoders
-    le_hand = load_pickle('le_hand.pkl')
-    le_fingering = load_pickle('le_fingering.pkl')
-
-    # 分离标注和未标注数据（未标注数据标记为10）
-    labeled_idx = y_train != 10
-    X_train_labeled = X_train[labeled_idx]
-    y_train_labeled = y_train[labeled_idx]
-    X_train_unlabeled = X_train[~labeled_idx]
-
-    print(f"已标注数据: {len(X_train_labeled)}, 未标注数据: {len(X_train_unlabeled)}")
-
-    # 模型参数
-    input_size = X_train.shape[2]
-    hidden_size = 256
-    num_layers = 3
-    num_classes = 10
-    dropout = 0.3
-    num_heads = 4
-
-    print(f"模型参数 - input_size: {input_size}, hidden_size: {hidden_size}, num_classes: {num_classes}")
-
-    # 初始化模型 - 使用新的层次化注意力模型
-    model = HierarchicalAttentionFingeringModel(
-        input_size=input_size,
-        num_classes=num_classes,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        dropout=dropout,
-        num_layers=num_layers
-    )
+    try:
+        # 尝试加载增强后的数据
+        X_train = np.load('X_train_aug.npy')
+        y_train = np.load('y_train_aug.npy')
+        X_val = np.load('X_val_aug.npy')
+        y_val = np.load('y_val_aug.npy')
+    except FileNotFoundError:
+        try:
+            # 尝试加载常规训练数据
+            X_train = np.load('X_train.npy')
+            y_train = np.load('y_train.npy')
+            X_val = np.load('X_val.npy')
+            y_val = np.load('y_val.npy')
+        except FileNotFoundError as e:
+            print(f"无法加载数据文件: {e}")
+            print("请确保已运行 'dataset_prep.py' 和 'data_process.py' 并生成所需的 .npy 文件。")
+            return
     
-    # 设备配置
-    device = torch.device("cuda" if torch.cuda.is_available() else 
-                         "mps" if torch.backends.mps.is_available() else "cpu")
-    model.to(device)
-    print(f"使用设备: {device}")
-
-    # 创建加强版数据集
-    train_dataset = EnhancedFingeringDataset(
-        X_train_labeled, 
-        y_train_labeled, 
-        le_hand, 
-        hand_index=2,
-        mirror_prob=0.5,
-        transpose_prob=0.2,
-        transpose_range=(-2, 2),
-        noise_prob=0.1
-    )
+    # 检查特征维度是否一致
+    if X_train.shape[2] != X_val.shape[2]:
+        print(f"警告: 训练集和验证集特征维度不匹配 - 训练集: {X_train.shape[2]}, 验证集: {X_val.shape[2]}")
+        print("重新创建训练集和验证集，确保特征维度一致...")
+        
+        # 结合所有数据重新划分
+        all_X = X_train
+        all_y = y_train
+        
+        # 从训练数据重新划分
+        indices = np.random.permutation(len(all_X))
+        train_size = int(0.8 * len(all_X))
+        
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:]
+        
+        X_train = all_X[train_indices]
+        y_train = all_y[train_indices]
+        X_val = all_X[val_indices]
+        y_val = all_y[val_indices]
+        
+        print(f"新的训练集/验证集大小: {X_train.shape} / {X_val.shape}")
     
-    val_dataset = EnhancedFingeringDataset(
-        X_val, y_val, le_hand, 
-        hand_index=2, 
-        mirror_prob=0.0,  # 验证集不做增强
-        transpose_prob=0.0,
-        noise_prob=0.0
-    )
+    print(f"训练集: X shape {X_train.shape}, y shape {y_train.shape}")
+    print(f"验证集: X shape {X_val.shape}, y shape {y_val.shape}")
     
-    # 计算类别权重用于加权损失函数
-    class_counts = np.bincount(y_train_labeled, minlength=10)
-    # 平滑处理类别权重，避免极端值
-    smoothed_class_counts = class_counts + 1
-    class_weights = 1.0 / (smoothed_class_counts / smoothed_class_counts.sum())
-    # 限制权重范围，避免过度惩罚稀有类别
-    class_weights = np.clip(class_weights, 0.5, 2.0)
+    # 输出类别分布
+    unique_classes, class_counts = np.unique(y_train, return_counts=True)
+    print("训练集类别分布:")
+    for cls, count in zip(unique_classes, class_counts):
+        print(f"  类别 {cls}: {count} 样本 ({100.0 * count / len(y_train):.2f}%)")
+    
+    # 检查数据中是否存在NaN或无穷大的值
+    if np.isnan(X_train).any() or np.isinf(X_train).any():
+        print("警告：训练集中存在NaN或无穷大值，将替换为0...")
+        X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    if np.isnan(X_val).any() or np.isinf(X_val).any():
+        print("警告：验证集中存在NaN或无穷大值，将替换为0...")
+        X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # 使用更稳健的方式计算均值和标准差
+    print("应用稳健的特征标准化...")
+    X_flat_train = X_train.reshape(-1, X_train.shape[2])
+    
+    # 计算均值和标准差，使用更稳健的方法处理离群值
+    q25 = np.percentile(X_flat_train, 25, axis=0)
+    q75 = np.percentile(X_flat_train, 75, axis=0)
+    iqr = q75 - q25
+    
+    # 将超出 IQR 范围 3 倍的值视为离群值并替换
+    upper_bound = q75 + 3 * iqr
+    lower_bound = q25 - 3 * iqr
+    
+    for i in range(X_flat_train.shape[1]):
+        X_flat_train[:, i] = np.clip(X_flat_train[:, i], lower_bound[i], upper_bound[i])
+    
+    # 计算新的均值和标准差
+    mean = np.mean(X_flat_train, axis=0)
+    std = np.std(X_flat_train, axis=0)
+    
+    # 避免除零，确保标准差最小值
+    std = np.maximum(std, 1e-6)
+    
+    # 应用标准化
+    X_train = (X_train - mean) / std
+    X_val = (X_val - mean) / std
+    
+    # 参数设置
+    input_size = X_train.shape[2]  # 特征数量
+    hidden_size = 128  # 增加隐藏层大小以适应CNN架构
+    num_classes = len(np.unique(y_train))
+    dropout = 0.4
+    
+    print(f"使用特征数量: {input_size}, 隐藏层大小: {hidden_size}, 类别数: {num_classes}")
+    
+    # 创建 Dataset 和 DataLoader
+    batch_size = 128  # 增大batch size以适应CNN训练特性
+    
+    train_dataset = FingeringDataset(X_train, y_train)
+    val_dataset = FingeringDataset(X_val, y_val)
+    
+    # 计算类别权重以处理数据不平衡
+    class_weights = compute_class_weight(
+        class_weight='balanced', 
+        classes=np.unique(y_train), 
+        y=y_train
+    )
+    class_weights = torch.tensor(class_weights, dtype=torch.float)
+    
+    print("类别权重:")
+    for i, weight in enumerate(class_weights):
+        print(f"  类别 {i}: {weight:.4f}")
+    
+    # 创建加权采样器 - 修改为更平衡的采样方法
+    sample_weights = np.ones_like(y_train, dtype=np.float32)
+    for i, cls in enumerate(np.unique(y_train)):
+        sample_weights[y_train == cls] = class_weights[i].item()
+    
     # 归一化权重
-    class_weights = class_weights / class_weights.sum() * len(class_weights)
-    print(f"类别权重: {class_weights}")
+    sample_weights = sample_weights / sample_weights.sum() * len(sample_weights)
     
-    # 使用WeightedRandomSampler进行平衡采样
-    sample_weights = train_dataset.get_sample_weights()
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(train_dataset), replacement=True)
-    
-    # 数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=64, sampler=sampler)
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-
-    # 优化器、损失函数和调度器
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-    criterion = WeightedFocalLoss(alpha=torch.tensor(class_weights, dtype=torch.float32), 
-                                 gamma=2, ignore_index=10)
-    
-    # 使用更先进的学习率调度器
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=0.002,
-        steps_per_epoch=len(train_loader),
-        epochs=50,
-        pct_start=0.1,
-        div_factor=10,
-        final_div_factor=100,
-        anneal_strategy='cos'
+    sampler = WeightedRandomSampler(
+        sample_weights, 
+        len(sample_weights), 
+        replacement=True
     )
-
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # Verify training batches for class distribution
+    print("验证训练批次的类分布...")
+    class_counts = np.zeros(num_classes, dtype=np.int32)
+    for i, (_, y_batch) in enumerate(train_loader):
+        for cls in range(num_classes):
+            class_counts[cls] += (y_batch == cls).sum().item()
+        if i >= 5:  # 只检查前5个批次
+            break
+    
+    print("前5个批次的类分布:")
+    for cls in range(num_classes):
+        print(f"  类别 {cls}: {class_counts[cls]} 样本")
+    
+    # 选择设备
+    device = torch.device("cuda" if torch.cuda.is_available() else 
+                          "mps" if torch.backends.mps.is_available() else "cpu")
+    print(f"使用设备: {device}")
+    
+    # 初始化CNN模型
+    model = CNNWithAttention(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_classes=num_classes,
+        dropout=dropout
+    ).to(device)
+    
+    print(model)
+    
+    # 计算模型参数数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"模型总参数: {total_params:,}")
+    print(f"可训练参数: {trainable_params:,}")
+    
+    # 定义优化器 - 使用 AdamW 并调整参数
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=0.001,  # 增加学习率以适应CNN架构
+        weight_decay=0.0005,  # 轻微权重衰减
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
+    
+    # 使用改进的 Focal Loss
+    criterion = FocalLoss(
+        alpha=class_weights.to(device),
+        gamma=2.0,  # 恢复标准gamma值
+        label_smoothing=0.1  # 轻微标签平滑
+    )
+    
+    # 使用 One Cycle 学习率调度器
+    steps_per_epoch = len(train_loader)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=0.001,
+        steps_per_epoch=steps_per_epoch,
+        epochs=30,
+        pct_start=0.3,  # 用30%的时间来提高学习率
+        anneal_strategy='cos',
+        final_div_factor=100
+    )
+    
     # 训练参数
-    num_epochs = 50
-    best_val_loss = float('inf')
+    num_epochs = 30
     best_val_acc = 0.0
-    patience = 8
-    trigger_times = 0
-    use_amp = True if device.type == 'cuda' else False  # 仅GPU支持混合精度训练
-
-    # 创建模型保存目录
-    os.makedirs('models', exist_ok=True)
+    patience = 10
+    counter = 0
+    best_model_state = None
     
-    print("第一阶段训练：仅使用标注数据...")
+    # 历史记录
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_loss': [],
+        'val_acc': [],
+        'class_accs': [],
+        'learning_rates': [],
+    }
+    
+    print(f"开始训练 {num_epochs} 个 epoch...")
+    
     for epoch in range(num_epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, use_amp)
-        val_loss, val_accuracy, class_accuracies = evaluate(model, val_loader, criterion, device)
-
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
-              f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
-        print(f"每类准确率: {', '.join([f'Class {i}: {acc:.4f}' for i, acc in enumerate(class_accuracies)])}")
-
-        # 早停机制 - 监控验证损失和验证准确率
-        if val_loss < best_val_loss or val_accuracy > best_val_acc:
-            # 保存最佳损失和最佳准确率模型
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(model.state_dict(), 'models/best_loss_model.pth')
-                
-            if val_accuracy > best_val_acc:
-                best_val_acc = val_accuracy
-                torch.save(model.state_dict(), 'models/best_acc_model.pth')
-                
-            trigger_times = 0
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+        
+        # 训练一个 epoch
+        train_loss, train_acc, _, _ = train_epoch(
+            model, train_loader, optimizer, criterion, device, clip_value=1.0
+        )
+        
+        # 评估模型
+        val_loss, val_acc, class_accs, conf_matrix, _, _ = evaluate_model(
+            model, val_loader, criterion, device
+        )
+        
+        # 更新学习率
+        # 注意：在这里不调用scheduler.step()，因为我们在每个batch之后调用
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # 更新历史记录
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['class_accs'].append(class_accs)
+        history['learning_rates'].append(current_lr)
+        
+        # 显示训练结果
+        print(f"训练损失: {train_loss:.4f} | 训练准确率: {train_acc:.4f}")
+        print(f"验证损失: {val_loss:.4f} | 验证准确率: {val_acc:.4f}")
+        print(f"当前学习率: {current_lr:.6f}")
+        print("每个类别的准确率:")
+        for i, acc in enumerate(class_accs):
+            print(f"  类别 {i}: {acc:.4f}")
+        
+        # 检查是否为最佳模型
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_model_state = model.state_dict()
+            counter = 0
+            
+            # 保存混淆矩阵
+            plot_confusion_matrix(conf_matrix, results_dir)
+            
+            print(f"新的最佳模型! 验证准确率: {val_acc:.4f}")
         else:
-            trigger_times += 1
-            if trigger_times >= patience:
-                print(f"触发早停机制，停止训练！(patience={patience})")
+            counter += 1
+            print(f"早停计数器: {counter}/{patience}")
+            
+            # 早停
+            if counter >= patience:
+                print(f"早停! 在 epoch {epoch + 1} 停止训练。")
                 break
-
-    # 自训练阶段
-    if len(X_train_unlabeled) > 0:
-        print("\n第二阶段训练：加入伪标签进行自训练...")
-        
-        # 加载验证准确率最高的模型
-        model.load_state_dict(torch.load('models/best_acc_model.pth'))
-        model.eval()
-
-        # 处理未标注数据的批次大小
-        batch_size = 128
-        all_pseudo_X = []
-        all_pseudo_y = []
-        confidence_thresholds = [0.95, 0.90, 0.85]  # 逐渐降低置信度阈值
-        
-        # 分批处理未标注数据以避免内存问题，并使用不同的置信度阈值
-        for threshold in confidence_thresholds:
-            print(f"使用置信度阈值 {threshold} 生成伪标签...")
-            for i in range(0, len(X_train_unlabeled), batch_size):
-                end = min(i + batch_size, len(X_train_unlabeled))
-                batch_X = X_train_unlabeled[i:end]
-
-                with torch.no_grad():
-                    X_unlabeled_tensor = torch.tensor(batch_X, dtype=torch.float32).to(device)
-                    outputs = model(X_unlabeled_tensor, hand_indices=2)
-                    if outputs.dim() > 2:  # 如果模型返回序列预测，取最后一个时间步
-                        outputs = outputs[:, -1, :]
-                    
-                    probabilities, predicted = torch.max(F.softmax(outputs, dim=1), 1)
-                    high_conf_idx = probabilities > threshold  # 置信度阈值
-
-                    # 收集高置信度的样本
-                    if high_conf_idx.sum().item() > 0:
-                        pseudo_X = batch_X[high_conf_idx.cpu().numpy()]
-                        pseudo_y = predicted[high_conf_idx].cpu().numpy()
-
-                        all_pseudo_X.append(pseudo_X)
-                        all_pseudo_y.append(pseudo_y)
-            
-            # 如果已经收集了足够多的伪标签样本，就退出循环
-            total_pseudo_samples = sum(len(x) for x in all_pseudo_X) if all_pseudo_X else 0
-            if total_pseudo_samples >= len(X_train_unlabeled) * 0.3:  # 如果已经标记了30%以上的未标注样本
-                print(f"已收集 {total_pseudo_samples} 个伪标签样本，停止降低置信度阈值")
-                break
-
-        # 合并所有伪标签样本
-        if all_pseudo_X:
-            pseudo_X = np.concatenate(all_pseudo_X, axis=0)
-            pseudo_y = np.concatenate(all_pseudo_y, axis=0)
-
-            print(f"添加 {len(pseudo_X)} 个伪标签样本到训练集")
-            
-            # 分析伪标签分布
-            pseudo_class_counts = np.bincount(pseudo_y, minlength=10)
-            print(f"伪标签类别分布: {pseudo_class_counts}")
-            
-            # 合并标注数据和伪标签数据
-            X_train_new = np.concatenate([X_train_labeled, pseudo_X], axis=0)
-            y_train_new = np.concatenate([y_train_labeled, pseudo_y], axis=0)
-            
-            # 创建新的数据集和数据加载器
-            train_dataset = EnhancedFingeringDataset(X_train_new, y_train_new, le_hand, 
-                                                   hand_index=2, mirror_prob=0.3)
-            
-            # 重新计算样本权重，但给伪标签样本较低的权重
-            sample_weights = train_dataset.get_sample_weights()
-            # 降低伪标签样本的权重
-            for i in range(len(X_train_labeled), len(sample_weights)):
-                sample_weights[i] *= 0.7  # 伪标签样本权重降低30%
-                
-            sampler = WeightedRandomSampler(
-                weights=sample_weights, 
-                num_samples=len(train_dataset), 
-                replacement=True
-            )
-            
-            train_loader = DataLoader(train_dataset, batch_size=64, sampler=sampler)
-
-            # 重置优化器和学习率调度器
-            optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-            scheduler = CosineAnnealingLR(optimizer, T_max=15, eta_min=0.00001)
-            
-            # 重置早停参数
-            best_val_loss = float('inf')
-            best_val_acc = 0.0
-            trigger_times = 0
-            patience = 5  # 自训练阶段使用更短的patience
-
-            # 继续训练
-            print("\n开始第二阶段训练（含伪标签）...")
-            for epoch in range(15):  # 自训练15个epoch
-                train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, use_amp)
-                val_loss, val_accuracy, class_accuracies = evaluate(model, val_loader, criterion, device)
-                
-                print(f"Self-Training Epoch [{epoch + 1}/15], Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, "
-                      f"Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
-                print(f"每类准确率: {', '.join([f'Class {i}: {acc:.4f}' for i, acc in enumerate(class_accuracies)])}")
-                
-                scheduler.step()
-                
-                # 早停机制
-                if val_loss < best_val_loss or val_accuracy > best_val_acc:
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
-                        torch.save(model.state_dict(), 'models/best_selftrain_loss_model.pth')
-                        
-                    if val_accuracy > best_val_acc:
-                        best_val_acc = val_accuracy
-                        torch.save(model.state_dict(), 'models/best_selftrain_acc_model.pth')
-                        
-                    trigger_times = 0
-                else:
-                    trigger_times += 1
-                    if trigger_times >= patience:
-                        print(f"触发早停机制，停止训练！")
-                        break
-
-    # 评估最终模型性能
-    print("\n评估模型性能...")
     
-    # 确定最佳模型文件
-    best_model_files = [
-        'models/best_acc_model.pth',
-        'models/best_selftrain_acc_model.pth'
-    ]
+    # 绘制训练历史
+    plot_training_history(history, results_dir)
     
-    best_model_path = None
-    best_accuracy = 0.0
+    # 加载最佳模型
+    if best_model_state:
+        model.load_state_dict(best_model_state)
+        print(f"已加载最佳模型 (验证准确率: {best_val_acc:.4f})")
     
-    for model_file in best_model_files:
-        if os.path.exists(model_file):
-            model.load_state_dict(torch.load(model_file))
-            _, accuracy, class_accs = evaluate(model, val_loader, criterion, device)
-            
-            print(f"模型 {model_file} 验证集准确率: {accuracy:.4f}")
-            print(f"每类准确率: {', '.join([f'Class {i}: {acc:.4f}' for i, acc in enumerate(class_accs)])}")
-            
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
-                best_model_path = model_file
+    # 最终评估
+    _, final_acc, final_class_accs, final_conf_matrix, all_preds, all_labels = evaluate_model(
+        model, val_loader, criterion, device
+    )
     
-    # 保存最终模型
-    if best_model_path:
-        print(f"\n最佳模型: {best_model_path}, 准确率: {best_accuracy:.4f}")
-        model.load_state_dict(torch.load(best_model_path))
-        torch.save(model.state_dict(), 'fingering_model_final.pth')
-        print("训练完成，最终模型已保存至 'fingering_model_final.pth'")
-    else:
-        torch.save(model.state_dict(), 'fingering_model_final.pth')
-        print("训练完成，最终模型已保存")
-
+    # 生成分类报告
+    class_report = classification_report(all_labels, all_preds, digits=4)
+    print("\n分类报告:")
+    print(class_report)
+    
+    # 保存分类报告
+    with open(f'{results_dir}/classification_report.txt', 'w') as f:
+        f.write("钢琴指法预测模型 (CNN+Attention) - 分类报告\n")
+        f.write("="*50 + "\n\n")
+        f.write(f"验证准确率: {final_acc:.4f}\n\n")
+        f.write("每个类别的准确率:\n")
+        for i, acc in enumerate(final_class_accs):
+            f.write(f"类别 {i}: {acc:.4f}\n")
+        f.write("\n详细分类报告:\n")
+        f.write(class_report)
+    
+    # 保存模型
+    torch.save(model.state_dict(), f'{results_dir}/cnn_attention_model_best.pth')
+    print(f"模型已保存到 {results_dir}/cnn_attention_model_best.pth")
 
 if __name__ == "__main__":
     main()

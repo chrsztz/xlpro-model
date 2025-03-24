@@ -1,0 +1,2 @@
+PIG_DATASET_PATH = 'PIGdata'
+FINGERING_FILES_PATH = 'PIGdata/FingeringFiles'

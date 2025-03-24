@@ -60,3 +60,77 @@
 ---
 
 💡 **研究进展仍在持续推进，期待取得更优的成果！** 🚀🎶
+
+# 钢琴指法生成 AI 模型 (Piano Fingering AI Model)
+
+本项目实现了一个使用深度学习为钢琴曲自动生成指法的 AI 模型。该模型基于 PIG（Professional Intended Fingering）数据集训练，通过序列建模和注意力机制学习专业钢琴家的指法规律。
+
+## 项目说明
+
+本项目基于 v0.1.2 版本进行优化，该版本使用 BiLSTM 与注意力机制在 PIG 数据集上取得了约 80% 的 F1 分数。本次优化主要包括：
+
+1. 引入 CNN 特征提取层，增强对局部模式的捕捉能力
+2. 改进的数据增强技术，包括镜像翻转、音高平移和噪声添加
+3. 加权采样和 Focal Loss，更好地处理类别不平衡
+4. 优化的学习率调度策略
+
+## 模型架构
+
+`EnhancedBiLSTMWithAttention` 模型结合了两种架构的优点：
+- CNN 层用于提取局部音乐特征
+- BiLSTM 层捕捉长时间依赖关系
+- 注意力机制关注最相关的上下文信息
+- 完全连接层进行最终分类
+
+## 数据处理流程
+
+1. 音符标准化与序列化 - 将原始 MIDI 数据转换为标准化序列
+2. 特征提取 - 提取音高、持续时间、手部位置等特征
+3. 数据增强 - 应用镜像翻转、移调等技术
+4. Word2Vec 特征融合 - 将离散特征转化为连续向量表示
+5. 特征组合 - 将所有特征整合为模型输入
+
+## 使用方法
+
+### 环境准备
+
+```bash
+pip install -r requirements.txt
+```
+
+### 训练模型
+
+```bash
+python model_training.py
+```
+
+### 评估模型
+
+```bash
+python test_model.py
+```
+
+### 预测新曲目指法
+
+```bash
+python predict_fingering.py path_to_midi_file
+```
+
+## 项目结构
+
+- `dataset_prep.py` - 数据集准备
+- `data_process.py` - 数据预处理
+- `data_utils.py` - 工具函数
+- `models.py` - 模型定义
+- `model_training.py` - 模型训练
+- `test_model.py` - 模型评估
+- `predict_fingering.py` - 指法预测
+
+## 关于数据集
+
+PIG 数据集是一个专业钢琴指法数据集，包含专业钢琴家标注的指法。这个数据集完全标注，有助于训练高质量的指法生成模型。
+
+## 参考资料
+
+- [PIG 数据集论文](https://arxiv.org/abs/1908.10500)
+- [深度学习钢琴指法生成综述](https://arxiv.org/abs/2101.00289)
