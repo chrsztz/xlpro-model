@@ -136,3 +136,88 @@ class AttentionMechanism(nn.Module):
         
         return context_vector, attn_weights
 
+# 定义新的 CNN 模型
+class CNNWithAttention(nn.Module):
+    def __init__(self, input_size, hidden_size, num_classes, dropout=0.5):
+        super(CNNWithAttention, self).__init__()
+        
+        # 输入标准化
+        self.input_norm = nn.LayerNorm(input_size)
+        
+        # CNN架构 - 使用不同大小的卷积核捕获不同尺度的特征
+        self.conv1 = nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(input_size, hidden_size, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(input_size, hidden_size, kernel_size=7, padding=3)
+        
+        # 批量归一化 - 加速训练并提高稳定性
+        self.bn1 = nn.BatchNorm1d(hidden_size)
+        self.bn2 = nn.BatchNorm1d(hidden_size)
+        self.bn3 = nn.BatchNorm1d(hidden_size)
+        
+        # 注意力层 - 增强对序列中重要部分的关注
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # 输出层
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 3, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(hidden_size // 2, num_classes)
+        )
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # 输入形状: [batch_size, seq_length, input_size]
+        batch_size, seq_len, features = x.size()
+        
+        # 应用输入标准化
+        x = self.input_norm(x)
+        
+        # 转换为卷积所需的形状
+        x_conv = x.transpose(1, 2)  # [batch_size, input_size, seq_length]
+        
+        # 应用不同尺度的卷积
+        conv1_out = F.relu(self.bn1(self.conv1(x_conv)))  # [batch_size, hidden_size, seq_length]
+        conv2_out = F.relu(self.bn2(self.conv2(x_conv)))
+        conv3_out = F.relu(self.bn3(self.conv3(x_conv)))
+        
+        # 转回序列形式
+        conv1_out = conv1_out.transpose(1, 2)  # [batch_size, seq_length, hidden_size]
+        conv2_out = conv2_out.transpose(1, 2)
+        conv3_out = conv3_out.transpose(1, 2)
+        
+        # 组合不同尺度的卷积特征
+        conv_cat = torch.cat([conv1_out, conv2_out, conv3_out], dim=2)  # [batch_size, seq_length, hidden_size*3]
+        
+        # 应用注意力机制
+        attn_weights = self.attention(conv_cat)  # [batch_size, seq_length, 1]
+        attn_weights = F.softmax(attn_weights, dim=1)
+        context = torch.sum(attn_weights * conv_cat, dim=1)  # [batch_size, hidden_size*3]
+        
+        # 输出分类结果
+        output = self.fc(context)
+        
+        return output

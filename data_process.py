@@ -5,7 +5,8 @@ import pandas as pd
 import pickle
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from imblearn.over_sampling import SMOTE
+import sklearn_crfsuite  # Add CRF import
+from sklearn_crfsuite import metrics
 from data_utils import (
     get_midi_number,
     is_black_key,
@@ -19,6 +20,154 @@ from data_utils import (
     load_pickle
 )
 from gensim.models import Word2Vec
+
+
+# Function to convert sequences to CRF features
+def sequence_to_crf_features(sequence, window_size=2):
+    """
+    Convert a sequence of notes to CRF features with context window.
+    
+    Args:
+        sequence: A sequence of feature dictionaries
+        window_size: Number of notes to consider before and after
+        
+    Returns:
+        List of dictionaries with features for CRF
+    """
+    features = []
+    seq_len = len(sequence)
+    
+    for i in range(seq_len):
+        # Basic features for current note
+        note_features = {
+            'pitch': sequence[i]['pitch_encoded'],
+            'duration': sequence[i]['duration_encoded'],
+            'hand': sequence[i]['hand_encoded'],
+            'black_key': sequence[i]['black_key'],
+            'chord': sequence[i]['chord'],
+            'midi_diff': sequence[i]['midi_diff_processed'],
+            'density': sequence[i]['note_density'],
+        }
+        
+        # Add context features (previous and next notes)
+        for offset in range(-window_size, window_size + 1):
+            if offset == 0:  # Skip current note (already added)
+                continue
+                
+            idx = i + offset
+            # Handle boundary conditions
+            if 0 <= idx < seq_len:
+                prefix = 'prev' if offset < 0 else 'next'
+                abs_offset = abs(offset)
+                note_features.update({
+                    f'{prefix}{abs_offset}_pitch': sequence[idx]['pitch_encoded'],
+                    f'{prefix}{abs_offset}_duration': sequence[idx]['duration_encoded'],
+                    f'{prefix}{abs_offset}_hand': sequence[idx]['hand_encoded'],
+                    f'{prefix}{abs_offset}_black_key': sequence[idx]['black_key'],
+                    f'{prefix}{abs_offset}_chord': sequence[idx]['chord'],
+                })
+            else:
+                # For out of bounds, use special indicators
+                prefix = 'prev' if offset < 0 else 'next'
+                abs_offset = abs(offset)
+                note_features.update({
+                    f'{prefix}{abs_offset}_pitch': -1,
+                    f'{prefix}{abs_offset}_duration': -1,
+                    f'{prefix}{abs_offset}_hand': -1,
+                    f'{prefix}{abs_offset}_black_key': -1,
+                    f'{prefix}{abs_offset}_chord': -1,
+                })
+        
+        features.append(note_features)
+    
+    return features
+
+
+# Function to train CRF model and extract CRF features
+def extract_crf_features(df, sequence_length=10):
+    """
+    Train a CRF model and extract CRF features
+    
+    Args:
+        df: DataFrame with note data
+        sequence_length: Length of sequences to consider
+        
+    Returns:
+        DataFrame with added CRF features
+    """
+    print("Training CRF model and extracting CRF features...")
+    
+    # Convert DataFrame rows to dictionaries for CRF feature extraction
+    df_dict = df.to_dict('records')
+    
+    # Extract CRF features for each sequence
+    crf_features = []
+    for i in range(0, len(df_dict), sequence_length):
+        if i + sequence_length <= len(df_dict):
+            seq = df_dict[i:i+sequence_length]
+            crf_features.extend(sequence_to_crf_features(seq))
+            
+    # Ensure the feature list is the same length as the DataFrame
+    if len(crf_features) < len(df):
+        # Pad with empty features for any remaining rows
+        remainder = len(df) - len(crf_features)
+        empty_features = [{'crf_placeholder': 0} for _ in range(remainder)]
+        crf_features.extend(empty_features)
+    elif len(crf_features) > len(df):
+        # Trim excess features
+        crf_features = crf_features[:len(df)]
+    
+    # Train CRF model on sequences and extract probabilities
+    X_crf = []
+    y_crf = []
+    
+    for i in range(0, len(df) - sequence_length):
+        X_crf.append(crf_features[i:i+sequence_length])
+        y_crf.append([str(y) for y in df['fingering_encoded'].values[i:i+sequence_length]])
+    
+    # Train CRF model
+    crf = sklearn_crfsuite.CRF(
+        algorithm='lbfgs',
+        c1=0.1,
+        c2=0.1,
+        max_iterations=100,
+        all_possible_transitions=True
+    )
+    
+    if len(X_crf) > 0:
+        print(f"Training CRF model with {len(X_crf)} sequences...")
+        crf.fit(X_crf, y_crf)
+        
+        # Extract probability features for each position
+        crf_probs = []
+        for seq_features in X_crf:
+            seq_probs = crf.predict_marginals_single(seq_features)
+            crf_probs.extend(seq_probs)
+        
+        # Flatten CRF probabilities to a fixed-size vector for each note
+        max_classes = max(len(probs) for probs in crf_probs) if crf_probs else 0
+        crf_vectors = []
+        
+        for probs in crf_probs:
+            vector = []
+            for i in range(max_classes):
+                class_key = str(i)
+                vector.append(probs.get(class_key, 0.0))
+            crf_vectors.append(vector)
+        
+        # Pad with zeros for notes without CRF features
+        zero_vector = [0.0] * max_classes
+        while len(crf_vectors) < len(df):
+            crf_vectors.append(zero_vector)
+        
+        # Add CRF vectors to DataFrame
+        df['crf_feature'] = crf_vectors[:len(df)]
+    else:
+        print("WARNING: Not enough data to train CRF model")
+        # Add empty CRF features
+        df['crf_feature'] = [[0.0]] * len(df)
+    
+    return df
 
 
 def main():
@@ -71,18 +220,20 @@ def main():
     print("部分 'word' 列样例：")
     print(df['word'].head())
     save_pickle(df, "df.pkl")
-    # **修改部分开始**
+    
     # 将 'word' 列拆分为单词列表
     tokenized_sentences = df['word'].apply(lambda x: x.split()).tolist()
     # 训练 Word2Vec-CBOW 模型
     word2vec_model = train_word2vec(tokenized_sentences, window=2, vector_size=128, min_count=1, workers=4)
-    # **修改部分结束**
 
     # 保存模型
     word2vec_model.save("word2vec_cbow.model")
 
     print("Word2Vec 模型已训练并保存。")
 
+    # 应用CRF特征提取
+    df = extract_crf_features(df, sequence_length=10)
+    
     # 获取融合特征
     df = get_fused_features(df, word2vec_model, tokenized_sentences)
 
@@ -98,10 +249,10 @@ def main():
 
     # 更新特征集
     feature_columns_extended = ['pitch_encoded', 'duration_encoded', 'hand_encoded',
-                                'midi_diff_processed', 'real_duration',
-                                'note_density', 'black_key', 'chord']
+                               'midi_diff_processed', 'real_duration',
+                               'note_density', 'black_key', 'chord']
 
-    # 将融合特征附加到原始特征
+    # 将融合特征和CRF特征附加到原始特征
     df = combine_features(df, feature_columns_extended)
 
     print("部分 'combined_features' 样例：")
@@ -145,22 +296,15 @@ def main():
     print(f"训练集样本数: {X_train_seq.shape[0]}")
     print(f"验证集样本数: {X_val_seq.shape[0]}")
 
-    # 使用 SMOTE 进行过采样（针对序列数据，需谨慎使用）
-    # 注意：SMOTE 主要适用于非序列数据，以下为一种处理方法
-    # 您也可以选择仅使用类别权重而不使用 SMOTE
-    smote = SMOTE(random_state=42)
-    X_train_reshaped = X_train_seq.reshape(X_train_seq.shape[0], -1)
-    X_val_reshaped = X_val_seq.reshape(X_val_seq.shape[0], -1)
+    # 移除SMOTE过采样代码
+    # 直接使用原始的训练集和验证集
+    X_train_resampled = X_train_seq
+    y_train_resampled = y_train_seq
+    X_val_resampled = X_val_seq
+    y_val_resampled = y_val_seq
 
-    X_train_resampled, y_train_resampled = smote.fit_resample(X_train_reshaped, y_train_seq)
-    X_val_resampled, y_val_resampled = smote.fit_resample(X_val_reshaped, y_val_seq)
-
-    # 将数据重新转换为序列格式
-    X_train_resampled = X_train_resampled.reshape(-1, sequence_length, X_seq.shape[2])
-    X_val_resampled = X_val_resampled.reshape(-1, sequence_length, X_seq.shape[2])
-
-    print(f"过采样后训练集序列形状: {X_train_resampled.shape}, 标签形状: {y_train_resampled.shape}")
-    print(f"过采样后验证集序列形状: {X_val_resampled.shape}, 标签形状: {y_val_resampled.shape}")
+    print(f"处理后训练集序列形状: {X_train_resampled.shape}, 标签形状: {y_train_resampled.shape}")
+    print(f"处理后验证集序列形状: {X_val_resampled.shape}, 标签形状: {y_val_resampled.shape}")
 
     # 数据增强：镜像对称
     def augment_mirror_symmetry(X, y, le_fingering, le_hand):
@@ -181,7 +325,7 @@ def main():
                 # 翻转指法（具体翻转规则需根据手指编号定义）
                 # 假设有 5 个手指，翻转规则如：1↔5, 2↔4, 3不变
                 finger_flip = {0: 4, 1: 3, 2: 2, 3: 1, 4: 0}
-                y_mirror = np.array([finger_flip.get(f, f) for f in y[i]])
+                y_mirror = finger_flip.get(y[i], y[i])
 
                 X_aug.append(X_mirror)
                 y_aug.append(y_mirror)

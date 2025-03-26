@@ -248,22 +248,24 @@ def get_fused_features(df, word2vec_model, tokenized_sentences):
 
 
 def combine_features(df, feature_columns):
-    """将融合特征与原始特征组合，确保总维度为136"""
-
-    def combine(row):
-        # 基础特征
-        base_features = row[feature_columns].values  # 8维
-        # 融合特征应该是128维 (136-8=128)
-        fused_features = row['fused_feature_scaled']
-        return np.concatenate([base_features, fused_features])
-
-    df['combined_features'] = df.apply(combine, axis=1)
-
-    # 验证维度
-    sample_dim = len(df['combined_features'].iloc[0])
-    print(f"Combined feature dimension: {sample_dim}")
-    assert sample_dim == 136, f"Expected 136 features, got {sample_dim}"
-
+    """Combine original features with word2vec and CRF features."""
+    combined_features = []
+    
+    for i, row in df.iterrows():
+        # 获取原始特征
+        orig_features = [row[col] for col in feature_columns]
+        
+        # 获取融合特征
+        fused_feature = row['fused_feature_scaled'] if 'fused_feature_scaled' in row else []
+        
+        # 获取CRF特征
+        crf_feature = row['crf_feature'] if 'crf_feature' in row else []
+        
+        # 结合所有特征
+        combined = np.concatenate([orig_features, fused_feature, crf_feature])
+        combined_features.append(combined)
+    
+    df['combined_features'] = combined_features
     return df
 
 def save_pickle(obj, filename):
