@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm 
 from data_utils import load_pickle
-from models import TransformerModel,BiGRU,BiLSTM,BiLSTMWithAttention,CNNWithAttention
+from models import TransformerModel,BiGRU,BiLSTM,BiLSTMWithAttention,CNNWithAttention,EnhancedFingeringModel
 
 # 定义改进的 Focal Loss
 class FocalLoss(nn.Module):
@@ -419,11 +419,10 @@ def main():
     print(f"使用设备: {device}")
     
     # 初始化CNN模型
-    model = BiLSTMWithAttention(
+    model = CNNWithAttention(
         input_size=input_size,
         hidden_size=hidden_size,
         num_classes=num_classes,
-        num_layers=num_layers,
         dropout=dropout
     ).to(device)
     

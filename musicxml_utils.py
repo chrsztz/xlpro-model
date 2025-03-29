@@ -177,23 +177,91 @@ def extract_all_features(score):
 
 
 def apply_predicted_fingering(score, predicted_fingerings):
-    """应用预测的指法到乐谱"""
+    """应用预测的指法到乐谱，确保包括和弦音符在内的所有音符都有正确的指法"""
+    from music21 import articulations
+    # 获取手部信息
+    hand_mapping = determine_hands(score)
+    
+    # 首先收集所有音符及其索引，包括和弦中的音符
+    all_notes = []
     fingering_idx = 0
-
+    
+    # 清除旧指法并收集所有音符
     for part in score.parts:
         for measure in part.getElementsByClass('Measure'):
             for element in measure.notesAndRests:
                 if isinstance(element, note.Note):
-                    if fingering_idx < len(predicted_fingerings):
-                        fingering = predicted_fingerings[fingering_idx]
-                        # 因为已经是实际指法值了，不需要再转换
-                        element.articulations.append(articulations.Fingering(fingering))
-                        fingering_idx += 1
+                    # 清除当前指法
+                    element.articulations = [a for a in element.articulations if not isinstance(a, articulations.Fingering)]
+                    all_notes.append((element, part))
+                    fingering_idx += 1
                 elif isinstance(element, chord.Chord):
-                    for n in element.notes:
-                        if fingering_idx < len(predicted_fingerings):
-                            fingering = predicted_fingerings[fingering_idx]
-                            n.articulations.append(articulations.Fingering(fingering))
-                            fingering_idx += 1
-
+                    # 对和弦中的音符按音高排序
+                    for n in sorted(element.notes, key=lambda x: x.pitch.midi):
+                        # 清除当前指法
+                        n.articulations = [a for a in n.articulations if not isinstance(a, articulations.Fingering)]
+                        all_notes.append((n, part))
+                        fingering_idx += 1
+    
+    # 确保预测的指法数量与音符数量匹配
+    if len(predicted_fingerings) < len(all_notes):
+        print(f"警告：预测指法数量 ({len(predicted_fingerings)}) 少于音符数量 ({len(all_notes)})")
+        # 补齐缺失的指法
+        predicted_fingerings = list(predicted_fingerings) + [1] * (len(all_notes) - len(predicted_fingerings))
+    elif len(predicted_fingerings) > len(all_notes):
+        print(f"警告：预测指法数量 ({len(predicted_fingerings)}) 多于音符数量 ({len(all_notes)})")
+        predicted_fingerings = predicted_fingerings[:len(all_notes)]
+    
+    # 应用指法
+    chord_count = 0
+    chord_notes_count = 0
+    
+    # 统计和弦信息
+    for part in score.parts:
+        for measure in part.getElementsByClass('Measure'):
+            for element in measure.notesAndRests:
+                if isinstance(element, chord.Chord):
+                    chord_count += 1
+                    chord_notes_count += len(element.notes)
+    
+    # 应用指法
+    for i, (note_obj, part) in enumerate(all_notes):
+        if i < len(predicted_fingerings):
+            fingering = predicted_fingerings[i]
+            part_hand = hand_mapping.get(part, 'right')
+            
+            # 根据手部调整指法符号
+            if part_hand == 'left' and fingering > 0:
+                fingering = -fingering  # 左手使用负号
+            elif part_hand == 'right' and fingering < 0:
+                fingering = abs(fingering)  # 右手使用正号
+            
+            # 创建指法对象并添加到音符
+            finger_obj = articulations.Fingering(fingerNumber=fingering)
+            note_obj.articulations.append(finger_obj)
+    
+    # 强制确保和弦音符的指法被正确标记
+    chord_note_count_with_fingering = 0
+    for part in score.parts:
+        for measure in part.getElementsByClass('Measure'):
+            for element in measure.getElementsByClass('Chord'):
+                for n in element.notes:
+                    has_fingering = False
+                    for a in n.articulations:
+                        if isinstance(a, articulations.Fingering):
+                            has_fingering = True
+                            chord_note_count_with_fingering += 1
+                            break
+                    
+                    if not has_fingering:
+                        # 如果没有指法，尝试添加一个默认指法
+                        part_hand = hand_mapping.get(part, 'right')
+                        default_fingering = 1 if part_hand == 'right' else -1
+                        finger_obj = articulations.Fingering(fingerNumber=default_fingering)
+                        n.articulations.append(finger_obj)
+                        chord_note_count_with_fingering += 1
+    
+    print(f"指法应用完成。共处理 {chord_count} 个和弦，{chord_notes_count} 个和弦音符")
+    print(f"和弦音符指法覆盖率: {chord_note_count_with_fingering}/{chord_notes_count} ({chord_note_count_with_fingering/chord_notes_count*100:.2f}% 如果至少有一个音符有指法)")
+    
     return score

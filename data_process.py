@@ -26,7 +26,7 @@ from gensim.models import Word2Vec
 def sequence_to_crf_features(sequence, window_size=2):
     """
     Convert a sequence of notes to CRF features with context window.
-    
+
     Args:
         sequence: A sequence of feature dictionaries
         window_size: Number of notes to consider before and after
@@ -66,7 +66,7 @@ def sequence_to_crf_features(sequence, window_size=2):
                     f'{prefix}{abs_offset}_black_key': sequence[idx]['black_key'],
                     f'{prefix}{abs_offset}_chord': sequence[idx]['chord'],
                 })
-            else:
+        else:
                 # For out of bounds, use special indicators
                 prefix = 'prev' if offset < 0 else 'next'
                 abs_offset = abs(offset)

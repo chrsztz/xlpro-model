@@ -221,3 +221,101 @@ class CNNWithAttention(nn.Module):
         output = self.fc(context)
         
         return output
+    
+# Enhanced fingering model with CNN, BiLSTM, and attention
+class EnhancedFingeringModel(nn.Module):
+    """
+    增强版指法预测模型
+    多头注意力+ResNet风格的残差连接+Dropout+BatchNorm+LayerNorm
+    """
+    def __init__(self, input_size, hidden_size, num_classes=10, num_heads=4):
+        super(EnhancedFingeringModel, self).__init__()
+        
+        # CNN特征提取
+        self.conv_layers = nn.Sequential(
+            nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool1d(kernel_size=2, stride=1, padding=1)
+        )
+        
+        # 双向LSTM
+        self.lstm = nn.LSTM(
+            input_size=hidden_size, 
+            hidden_size=hidden_size//2,
+            num_layers=2,
+            dropout=0.3,
+            bidirectional=True,
+            batch_first=True
+        )
+        
+        # 多头自注意力机制
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size, 
+            num_heads=num_heads,
+            dropout=0.1
+        )
+        
+        # 输出层
+        self.global_attn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # 全连接层
+        self.fc_layers = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.Dropout(0.4),
+            nn.LeakyReLU(0.1),
+            nn.Linear(hidden_size, hidden_size//2),
+            nn.LayerNorm(hidden_size//2),
+            nn.Dropout(0.3),
+            nn.LeakyReLU(0.1),
+            nn.Linear(hidden_size//2, num_classes)
+        )
+        
+        # 分类器 - 单独处理每个类
+        self.classifiers = nn.ModuleList([
+            nn.Linear(hidden_size, 1) for _ in range(num_classes)
+        ])
+        
+    def forward(self, x):
+        batch_size, seq_len, features = x.size()
+        
+        # CNN特征提取
+        x_cnn = x.transpose(1, 2)  # [batch, features, seq_len]
+        x_cnn = self.conv_layers(x_cnn)
+        x_cnn = x_cnn.transpose(1, 2)  # [batch, seq_len, hidden_size]
+        
+        # BiLSTM处理
+        lstm_out, _ = self.lstm(x_cnn)  # [batch, seq_len, hidden_size]
+        
+        # 多头自注意力
+        lstm_out_t = lstm_out.transpose(0, 1)  # [seq_len, batch, hidden_size]
+        attn_out, _ = self.multihead_attn(lstm_out_t, lstm_out_t, lstm_out_t)
+        attn_out = attn_out.transpose(0, 1)  # [batch, seq_len, hidden_size]
+        
+        # 残差连接和层归一化
+        combined = lstm_out + attn_out  # 残差连接
+        combined = F.layer_norm(combined, [combined.size(-1)])  # 层归一化
+        
+        # 全局注意力
+        attn_weights = self.global_attn(combined)
+        attn_weights = F.softmax(attn_weights, dim=1)
+        context = torch.sum(attn_weights * combined, dim=1)
+        
+        # 主输出 - 共享特征
+        main_logits = self.fc_layers(context)
+        
+        # 单独的分类器
+        class_logits = torch.cat([cls(context) for cls in self.classifiers], dim=1)
+        
+        # 混合主输出和专用分类器 (主要使用主输出，但给予专用分类器一些权重)
+        mixed_logits = main_logits * 0.7 + class_logits * 0.3
+        
+        return mixed_logits

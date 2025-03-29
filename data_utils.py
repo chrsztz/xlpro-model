@@ -253,10 +253,10 @@ def combine_features(df, feature_columns):
     
     for i, row in df.iterrows():
         # 获取原始特征
-        orig_features = [row[col] for col in feature_columns]
+        orig_features = [float(row[col]) for col in feature_columns]
         
         # 获取融合特征
-        fused_feature = row['fused_feature_scaled'] if 'fused_feature_scaled' in row else []
+        fused_feature = row['fused_feature'] if 'fused_feature' in row else []
         
         # 获取CRF特征
         crf_feature = row['crf_feature'] if 'crf_feature' in row else []
