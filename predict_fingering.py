@@ -23,6 +23,11 @@ from data_utils import (
 )
 from models import EnhancedFingeringModel, CNNWithAttention, BiLSTMWithAttention
 
+# Import model-based RL fingering implementation
+from rl_fingering_model.main import process_musicxml_file
+from rl_fingering_model.segmentation import extract_notes_from_stream, prepare_notes_for_fingering
+from rl_fingering_model.reinforcement import optimize_fingering
+
 
 def preprocess_score_data(score_path, model_dir='.'):
     """预处理乐谱数据，确保与训练数据格式完全一致"""
@@ -234,9 +239,49 @@ def preprocess_score_data(score_path, model_dir='.'):
     return score, X_seq, df
 
 
-def predict_fingering(score_path, model_path='./results_cnn/bilstm_cnn_attention_model_best.pth', model_dir='.'):
+def predict_fingering(score_path, model_path='./results_cnn/bilstm_cnn_attention_model_best.pth', model_dir='.', use_rl=False):
     """预测指法并应用到乐谱"""
     print(f"开始预测指法: {score_path}")
+    
+    if use_rl:
+        # Use the RL-based method
+        return predict_fingering_reinforcement_learning(score_path)
+    else:
+        # Use the deep learning method
+        return predict_fingering_deep_learning(score_path, model_path, model_dir)
+
+
+def predict_fingering_reinforcement_learning(score_path, output_path=None):
+    """使用基于模型的强化学习方法预测指法"""
+    print(f"使用强化学习方法分析乐谱: {score_path}")
+    
+    # 如果没有指定输出路径，生成默认输出路径
+    if output_path is None:
+        output_path = score_path.replace('.musicxml', '_rl_fingering.musicxml').replace('.mxl', '_rl_fingering.mxl')
+    
+    # 使用 model-based RL 方法处理乐谱文件
+    score = process_musicxml_file(
+        input_file=score_path,
+        output_file=output_path,
+        hand='both',
+        parallel=True,
+        alpha=0.99,
+        gamma=1.0,
+        epsilon=0.8,
+        theta=3.0,
+        max_iterations=1000,
+        n_planning_steps=10,
+        verbose=True
+    )
+    
+    print(f"带强化学习生成的指法的乐谱已保存到: {output_path}")
+    
+    return score, None, None  # Return same signature as deep learning method but with None for fingerings and confidence
+
+
+def predict_fingering_deep_learning(score_path, model_path='./results_cnn/bilstm_cnn_attention_model_best.pth', model_dir='.'):
+    """使用深度学习方法预测指法"""
+    print(f"使用深度学习方法分析乐谱: {score_path}")
     
     # 预处理数据
     score, X_seq, df = preprocess_score_data(score_path, model_dir)
@@ -433,48 +478,29 @@ def main():
     """主函数"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='钢琴指法预测工具')
-    parser.add_argument('input_file', type=str, help='输入的MusicXML文件路径')
-    parser.add_argument('--output_file', type=str, help='输出的MusicXML文件路径')
-    parser.add_argument('--model', type=str, default='./results_cnn/bilstm_cnn_attention_model_best.pth', 
-                        help='模型文件路径')
+    parser = argparse.ArgumentParser(description='预测钢琴指法并应用到乐谱')
+    parser.add_argument('input_file', help='输入乐谱文件路径（MusicXML格式）')
+    parser.add_argument('--model', default='./results_cnn/bilstm_cnn_attention_model_best.pth', 
+                       help='模型文件路径')
     parser.add_argument('--model_dir', type=str, default='.', 
-                        help='模型相关文件所在目录')
+                       help='模型相关文件所在目录')
+    parser.add_argument('--use_rl', action='store_true', help='使用强化学习方法预测指法')
+    parser.add_argument('--output', help='输出文件路径（仅对强化学习方法有效）')
     
     args = parser.parse_args()
     
-    # 确定输出文件名
-    if args.output_file:
-        output_path = args.output_file
-    else:
-        input_name = os.path.splitext(os.path.basename(args.input_file))[0]
-        output_path = f"{input_name}_with_fingering.mxl"
-    
     # 预测指法
-    try:
-        modified_score, fingerings, confidences = predict_fingering(
+    if args.use_rl and args.output:
+        # 使用指定的输出路径
+        predict_fingering_reinforcement_learning(args.input_file, args.output)
+    else:
+        # 使用默认行为
+        predict_fingering(
             args.input_file, 
             model_path=args.model,
-            model_dir=args.model_dir
+            model_dir=args.model_dir,
+            use_rl=args.use_rl
         )
-        
-        # 保存结果
-        modified_score.write('mxl', fp=output_path)
-        print(f"指法预测完成。已保存到 {output_path}")
-        
-        # 保存指法和置信度数据
-        confidence_path = f"{os.path.splitext(output_path)[0]}_confidences.csv"
-        pd.DataFrame({
-            'fingering': fingerings,
-            'confidence': confidences
-        }).to_csv(confidence_path, index=False)
-        print(f"置信度数据已保存到 {confidence_path}")
-        
-    except Exception as e:
-        print(f"处理过程中出错: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
 
 
 if __name__ == "__main__":

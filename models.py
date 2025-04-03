@@ -3,6 +3,188 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# 添加物理约束增强模型
+class PhysicalEnhancedFingeringModel(nn.Module):
+    """
+    物理约束增强型指法预测模型
+    
+    结合了深度学习的特征提取和物理约束评估，使用双阶段训练和前向规划
+    """
+    def __init__(self, input_size, hidden_size, num_classes=10, num_physical_features=12, 
+                 physical_weight=0.3, dropout=0.4):
+        super(PhysicalEnhancedFingeringModel, self).__init__()
+        
+        self.physical_weight = physical_weight  # 物理约束损失权重
+        
+        # CNN+BiLSTM 特征提取部分
+        self.conv_block = nn.Sequential(
+            nn.Conv1d(input_size, hidden_size, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.1),
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.1)
+        )
+        
+        # BiLSTM层
+        self.lstm = nn.LSTM(
+            input_size=hidden_size,
+            hidden_size=hidden_size // 2,
+            num_layers=2,
+            dropout=dropout if dropout > 0 else 0,
+            bidirectional=True,
+            batch_first=True
+        )
+        
+        # 注意力层
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # 物理约束评估网络 - 接收物理特征输入
+        # 确保输入维度匹配，默认使用9个物理特征
+        self.num_physical_features = num_physical_features
+        self.physical_net = nn.Sequential(
+            nn.Linear(num_physical_features, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(hidden_size // 2, num_classes),
+            nn.Softmax(dim=1)
+        )
+        
+        # 主分类器
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.Dropout(dropout),
+            nn.LeakyReLU(0.1),
+            nn.Linear(hidden_size, num_classes)
+        )
+        
+    def forward(self, x, physical_features=None):
+        """
+        Args:
+            x: 输入特征序列 [batch_size, seq_len, input_size]
+            physical_features: 物理约束特征 [batch_size, num_physical_features]
+                            如果为None，则仅使用主分类器
+        """
+        batch_size, seq_len, features = x.size()
+        
+        # CNN特征提取
+        x_reshaped = x.transpose(1, 2)  # [batch, input_size, seq_len]
+        conv_out = self.conv_block(x_reshaped)
+        conv_out = conv_out.transpose(1, 2)  # [batch, seq_len, hidden_size]
+        
+        # BiLSTM处理
+        lstm_out, _ = self.lstm(conv_out)  # [batch, seq_len, hidden_size]
+        
+        # 注意力机制
+        attn_weights = self.attention(lstm_out)  # [batch, seq_len, 1]
+        attn_weights = F.softmax(attn_weights, dim=1)
+        context = torch.sum(attn_weights * lstm_out, dim=1)  # [batch, hidden_size]
+        
+        # 主分类器预测
+        main_logits = self.classifier(context)
+        
+        if physical_features is not None:
+            # 物理约束分类器预测
+            physical_logits = self.physical_net(physical_features)
+            
+            # 融合两个分类器的结果
+            # main_logits是原始logits，physical_logits是softmax后的概率
+            # 转换main_logits为概率
+            main_probs = F.softmax(main_logits, dim=1)
+            
+            # 加权融合
+            combined_probs = (1 - self.physical_weight) * main_probs + self.physical_weight * physical_logits
+            
+            # 返回logits和概率
+            return main_logits, combined_probs
+        else:
+            # 仅使用主分类器
+            return main_logits, F.softmax(main_logits, dim=1)
+    
+    def extract_physical_features(self, x):
+        """
+        从输入序列中提取与物理约束相关的特征
+        实现前向规划能力，评估多个可能的指法序列
+        
+        Args:
+            x: 输入特征序列 [batch_size, seq_len, input_size]
+            
+        Returns:
+            物理特征 [batch_size, num_physical_features]
+        """
+        # 这里实现从输入特征提取物理约束相关特征的逻辑
+        # 在实际应用中，可以使用滑动窗口提取特征或直接从特征向量中选择物理约束相关维度
+        
+        # 确保提取正确数量的物理特征，与模型期望的num_physical_features匹配
+        batch_size = x.size(0)
+        # 获取最后一个时间步的最后n个特征
+        if x.size(2) >= self.num_physical_features:
+            return x[:, -1, -self.num_physical_features:]
+        else:
+            # 如果特征不足，填充到必要的数量
+            features = x[:, -1, :]  # 获取所有可用特征
+            padding = torch.zeros(batch_size, self.num_physical_features - x.size(2), device=x.device)
+            return torch.cat([features, padding], dim=1)
+    
+    def forward_planning(self, x, top_k=3, max_depth=3):
+        """
+        实现前向规划，类似于RL的规划过程
+        
+        Args:
+            x: 输入特征序列 [batch_size, seq_len, input_size]
+            top_k: 每步考虑的最佳动作数
+            max_depth: 最大规划深度
+            
+        Returns:
+            最佳指法预测 [batch_size]
+        """
+        # 阶段1：通过主网络获取初始预测
+        main_logits, main_probs = self.forward(x)
+        
+        # 获取每个样本top_k个最可能的指法
+        _, top_indices = torch.topk(main_probs, top_k, dim=1)
+        
+        batch_size = x.size(0)
+        best_scores = torch.zeros(batch_size).to(x.device)
+        best_actions = torch.zeros(batch_size, dtype=torch.long).to(x.device)
+        
+        # 阶段2：对每个样本的top_k个指法进行前向规划和评估
+        for b in range(batch_size):
+            max_score = float('-inf')
+            best_action = -1
+            
+            # 提取物理特征
+            physical_features = self.extract_physical_features(x[b:b+1])
+            
+            # 确保物理特征的形状符合预期
+            if physical_features.size(1) != self.num_physical_features:
+                # 如果维度不匹配，调整为正确的维度
+                if physical_features.size(1) > self.num_physical_features:
+                    physical_features = physical_features[:, :self.num_physical_features]
+                else:
+                    padding = torch.zeros(1, self.num_physical_features - physical_features.size(1), device=x.device)
+                    physical_features = torch.cat([physical_features, padding], dim=1)
+            
+            # 评估每个候选指法
+            for action_idx in top_indices[b]:
+                # 这里可以扩展为多步前向规划，递归评估多个步骤
+                # 简化实现：直接使用物理网络评估单步分数
+                action_score = main_probs[b, action_idx] * (1 + self.physical_net(physical_features)[0, action_idx])
+                
+                if action_score > max_score:
+                    max_score = action_score
+                    best_action = action_idx
+            
+            best_scores[b] = max_score
+            best_actions[b] = best_action
+        
+        return best_actions
+
 # Transformer 模型
 class TransformerModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_heads, num_layers, num_classes, dropout=0.5):

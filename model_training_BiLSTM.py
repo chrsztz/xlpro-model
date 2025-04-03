@@ -14,7 +14,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm 
 from data_utils import load_pickle
-from models import BiLSTMWithAttention,CNNWithAttention,EnhancedFingeringModel
+from models import BiLSTMWithAttention,CNNWithAttention,EnhancedFingeringModel, PhysicalEnhancedFingeringModel
+import argparse
+import torch.optim as optim
+from torch.utils.data import TensorDataset
+import pandas as pd
 
 # 定义改进的 Focal Loss
 class FocalLoss(nn.Module):
@@ -245,7 +249,317 @@ def plot_confusion_matrix(conf_matrix, save_path='results'):
     plt.savefig(f'{save_path}/confusion_matrix.png')
     plt.close()
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train BiLSTM model for piano fingering')
+    parser.add_argument('--model_type', type=str, default='physical_enhanced',
+                        choices=['bilstm', 'transformer', 'bigru', 'bilstm_attention', 
+                                'cnn_attention', 'enhanced', 'physical_enhanced'],
+                        help='Model type to use')
+    parser.add_argument('--input_size', type=int, default=136,
+                        help='Input feature dimension')
+    parser.add_argument('--hidden_size', type=int, default=128,
+                        help='Hidden layer size')
+    parser.add_argument('--num_layers', type=int, default=2,
+                        help='Number of LSTM/GRU layers')
+    parser.add_argument('--num_heads', type=int, default=4,
+                        help='Number of attention heads for Transformer')
+    parser.add_argument('--num_classes', type=int, default=10,
+                        help='Number of output classes')
+    parser.add_argument('--dropout', type=float, default=0.3,
+                        help='Dropout rate')
+    parser.add_argument('--batch_size', type=int, default=64,
+                        help='Batch size for training')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-5,
+                        help='Weight decay for optimizer')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='Early stopping patience')
+    parser.add_argument('--use_augmented', action='store_true',
+                        help='Use augmented data')
+    parser.add_argument('--physical_weight', type=float, default=0.3,
+                        help='Weight for physical constraint loss')
+    parser.add_argument('--num_physical_features', type=int, default=12,
+                        help='Number of physical constraint features')
+    return parser.parse_args()
+
+def extract_physical_features(X):
+    """
+    从输入特征中提取物理约束相关特征
+    
+    Args:
+        X: 输入特征序列 [batch_size, seq_len, input_size]
+        
+    Returns:
+        物理特征 [batch_size, num_physical_features]
+    """
+    # 假设物理特征是输入向量的最后12个维度（伸展率、交叉指法距离、白键距离等）
+    # 使用序列的最后一个时间步
+    return X[:, -1, -12:]
+
+class PhysicalConstraintLoss(nn.Module):
+    """
+    基于物理约束的损失函数
+    重点惩罚不符合人体工程学的指法
+    """
+    def __init__(self, num_classes=10):
+        super(PhysicalConstraintLoss, self).__init__()
+        self.base_loss = nn.CrossEntropyLoss()
+        self.num_classes = num_classes
+        
+    def forward(self, logits, targets, physical_features):
+        """
+        Args:
+            logits: 模型输出的 logits [batch_size, num_classes]
+            targets: 真实标签 [batch_size]
+            physical_features: 物理约束特征 [batch_size, num_physical_features]
+            
+        Returns:
+            combined_loss: 合并基础损失和物理约束损失
+        """
+        # 基础分类损失
+        base_loss = self.base_loss(logits, targets)
+        
+        # 物理约束损失 - 使用物理特征加权
+        # 提取与伸展率相关的特征 (假设是前几个特征)
+        stretch_features = physical_features[:, :6]  # 伸展率特征
+        
+        # 计算平均伸展率
+        mean_stretch = torch.mean(stretch_features, dim=1)
+        
+        # 获取模型预测的类别
+        _, predicted = torch.max(logits, 1)
+        
+        # 检查预测是否正确
+        correct_mask = (predicted == targets)
+        
+        # 对于错误预测，增加物理惩罚
+        # 构建物理惩罚权重 - 错误预测但符合物理约束的惩罚较轻
+        physical_weights = torch.ones_like(mean_stretch)
+        physical_weights[~correct_mask] = 1.0 + mean_stretch[~correct_mask]
+        
+        # 应用物理权重到损失
+        weighted_loss = base_loss * torch.mean(physical_weights)
+        
+        return weighted_loss
+
+def train(model, train_loader, val_loader, optimizer, scheduler, criterion, 
+          device, epochs, patience, model_type='bilstm', physical_weight=0.3):
+    """
+    训练模型
+    
+    Args:
+        model: 神经网络模型
+        train_loader: 训练数据加载器
+        val_loader: 验证数据加载器
+        optimizer: 优化器
+        scheduler: 学习率调度器
+        criterion: 损失函数
+        device: 训练设备 (CPU/GPU)
+        epochs: 训练轮数
+        patience: 早停耐心值
+        model_type: 模型类型
+        physical_weight: 物理约束损失权重
+        
+    Returns:
+        trained_model: 训练好的模型
+        history: 训练历史 (loss, accuracy等)
+    """
+    best_val_acc = 0.0
+    patience_counter = 0
+    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
+    
+    physical_loss_fn = None
+    if model_type == 'physical_enhanced':
+        physical_loss_fn = PhysicalConstraintLoss(num_classes=model.classifier[-1].out_features)
+    
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        
+        print(f"Epoch {epoch+1}/{epochs}")
+        progress_bar = tqdm(train_loader, desc="Training")
+        
+        for batch_idx, (inputs, targets) in enumerate(progress_bar):
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            
+            # 处理不同模型类型的前向传播
+            if model_type == 'physical_enhanced':
+                # 提取物理特征
+                physical_features = extract_physical_features(inputs)
+                
+                # 前向传播
+                logits, combined_probs = model(inputs, physical_features)
+                
+                # 组合损失
+                base_loss = criterion(logits, targets)
+                
+                if physical_loss_fn:
+                    phys_loss = physical_loss_fn(logits, targets, physical_features)
+                    loss = (1 - physical_weight) * base_loss + physical_weight * phys_loss
+                else:
+                    loss = base_loss
+                
+                # 使用主分类器的logits计算准确率
+                _, predicted = torch.max(logits.data, 1)
+            else:
+                # 标准前向传播
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                _, predicted = torch.max(outputs.data, 1)
+            
+            # 反向传播和优化
+            loss.backward()
+            optimizer.step()
+            
+            # 统计
+            train_loss += loss.item()
+            train_total += targets.size(0)
+            train_correct += predicted.eq(targets).sum().item()
+            
+            progress_bar.set_postfix({
+                'loss': train_loss / (batch_idx + 1),
+                'acc': 100. * train_correct / train_total
+            })
+        
+        # 计算平均训练损失和准确率
+        train_loss = train_loss / len(train_loader)
+        train_acc = 100. * train_correct / train_total
+        
+        # 验证
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for batch_idx, (inputs, targets) in enumerate(val_loader):
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                # 处理不同模型类型的前向传播
+                if model_type == 'physical_enhanced':
+                    # 验证时使用前向规划功能
+                    physical_features = extract_physical_features(inputs)
+                    logits, _ = model(inputs, physical_features)
+                    
+                    # 可选：使用前向规划获取最佳动作
+                    if hasattr(model, 'forward_planning'):
+                        predicted = model.forward_planning(inputs)
+                    else:
+                        _, predicted = torch.max(logits.data, 1)
+                    
+                    # 计算损失
+                    loss = criterion(logits, targets)
+                else:
+                    # 标准前向传播
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    _, predicted = torch.max(outputs.data, 1)
+                
+                # 统计
+                val_loss += loss.item()
+                val_total += targets.size(0)
+                val_correct += predicted.eq(targets).sum().item()
+        
+        # 计算平均验证损失和准确率
+        val_loss = val_loss / len(val_loader)
+        val_acc = 100. * val_correct / val_total
+        
+        # 更新学习率
+        if scheduler:
+            scheduler.step(val_loss)
+        
+        # 打印统计
+        print(f'Epoch {epoch+1}/{epochs} - '
+              f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% - '
+              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        
+        # 保存历史
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        
+        # 早停检查
+        if val_acc > best_val_acc:
+            print(f"Validation accuracy improved from {best_val_acc:.2f}% to {val_acc:.2f}%")
+            best_val_acc = val_acc
+            patience_counter = 0
+            # 保存最佳模型
+            torch.save(model.state_dict(), 'fingering_model_best.pth')
+        else:
+            patience_counter += 1
+            print(f"Validation accuracy did not improve. Patience: {patience_counter}/{patience}")
+            
+            if patience_counter >= patience:
+                print("Early stopping triggered!")
+                break
+    
+    # 加载最佳模型
+    model.load_state_dict(torch.load('fingering_model_best.pth'))
+    
+    return model, history
+
+def evaluate_model(model, test_loader, device, model_type='bilstm'):
+    """
+    评估模型
+    
+    Args:
+        model: 训练好的模型
+        test_loader: 测试数据加载器
+        device: 设备 (CPU/GPU)
+        model_type: 模型类型
+        
+    Returns:
+        test_acc: 测试准确率
+        conf_matrix: 混淆矩阵
+    """
+    model.eval()
+    test_correct = 0
+    test_total = 0
+    all_preds = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for inputs, targets in test_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            if model_type == 'physical_enhanced':
+                # 使用前向规划
+                if hasattr(model, 'forward_planning'):
+                    predicted = model.forward_planning(inputs)
+                else:
+                    # 常规推理
+                    logits, _ = model(inputs)
+                    _, predicted = torch.max(logits.data, 1)
+            else:
+                # 标准前向传播
+                outputs = model(inputs)
+                _, predicted = torch.max(outputs, 1)
+            
+            test_total += targets.size(0)
+            test_correct += predicted.eq(targets).sum().item()
+            
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(targets.cpu().numpy())
+    
+    test_acc = 100. * test_correct / test_total
+    print(f'Test Accuracy: {test_acc:.2f}%')
+    
+    # 计算混淆矩阵
+    conf_matrix = confusion_matrix(all_targets, all_preds)
+    
+    return test_acc, conf_matrix
+
 def main():
+    args = parse_args()
+    
     # 设置随机种子确保结果可重复
     torch.manual_seed(42)
     np.random.seed(42)

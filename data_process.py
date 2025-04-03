@@ -17,7 +17,15 @@ from data_utils import (
     get_fused_features,
     combine_features,
     save_pickle,
-    load_pickle
+    load_pickle,
+    calculate_physical_constraint_features,
+    calculate_stretching_rate,
+    calculate_hand_position,
+    calculate_hand_movement,
+    calculate_cross_fingering_distance,
+    count_fingering_mismatches,
+    count_inverse_fingerings,
+    white_key_distance
 )
 from gensim.models import Word2Vec
 
@@ -49,6 +57,11 @@ def sequence_to_crf_features(sequence, window_size=2):
             'density': sequence[i]['note_density'],
         }
         
+        # 添加物理约束特征（如果存在）
+        for key, value in sequence[i].items():
+            if any(substr in key for substr in ['stretch_rate', 'cross_dist', 'white_key_dist']):
+                note_features[key] = value
+        
         # Add context features (previous and next notes)
         for offset in range(-window_size, window_size + 1):
             if offset == 0:  # Skip current note (already added)
@@ -66,7 +79,7 @@ def sequence_to_crf_features(sequence, window_size=2):
                     f'{prefix}{abs_offset}_black_key': sequence[idx]['black_key'],
                     f'{prefix}{abs_offset}_chord': sequence[idx]['chord'],
                 })
-        else:
+            else:
                 # For out of bounds, use special indicators
                 prefix = 'prev' if offset < 0 else 'next'
                 abs_offset = abs(offset)
@@ -211,61 +224,120 @@ def main():
         df['is_chord'] = 0
     df['chord'] = df['is_chord']  # 0 或 1
 
-    # 特征提取
-    feature_columns = ['pitch_encoded', 'duration_encoded', 'hand_encoded',
-                       'midi_diff_processed', 'real_duration',
-                       'note_density', 'black_key', 'chord']
-    df = create_word_column(df, feature_columns)
-
-    print("部分 'word' 列样例：")
-    print(df['word'].head())
-    save_pickle(df, "df.pkl")
+    # 计算物理约束特征
+    print("计算物理约束特征...")
+    df = calculate_physical_constraint_features(df, window_size=3)
     
-    # 将 'word' 列拆分为单词列表
-    tokenized_sentences = df['word'].apply(lambda x: x.split()).tolist()
-    # 训练 Word2Vec-CBOW 模型
-    word2vec_model = train_word2vec(tokenized_sentences, window=2, vector_size=128, min_count=1, workers=4)
-
-    # 保存模型
-    word2vec_model.save("word2vec_cbow.model")
-
-    print("Word2Vec 模型已训练并保存。")
-
-    # 应用CRF特征提取
-    df = extract_crf_features(df, sequence_length=10)
+    # 特征提取 - 使用优化后的物理特征集
+    # 基础特征
+    base_features = [
+        'pitch_encoded', 'duration_encoded', 'hand_encoded',
+        'midi_diff_processed', 'real_duration',
+        'note_density', 'black_key', 'chord'
+    ]
     
-    # 获取融合特征
-    df = get_fused_features(df, word2vec_model, tokenized_sentences)
-
-    # 将融合特征向量转化为多维特征
-    fused_features = np.vstack(df['fused_feature'].values)
-
-    # 标准化融合特征
-    scaler_fused = StandardScaler()
-    fused_features_scaled = scaler_fused.fit_transform(fused_features)
-
-    # 将融合特征添加到原始特征中
-    df['fused_feature_scaled'] = list(fused_features_scaled)
-
-    # 更新特征集
-    feature_columns_extended = ['pitch_encoded', 'duration_encoded', 'hand_encoded',
-                               'midi_diff_processed', 'real_duration',
-                               'note_density', 'black_key', 'chord']
-
-    # 将融合特征和CRF特征附加到原始特征
-    df = combine_features(df, feature_columns_extended)
-
-    print("部分 'combined_features' 样例：")
-    print(df['combined_features'].head())
-
-    # 提取特征和标签
-    X = np.stack(df['combined_features'].values)
+    # 获取新的物理约束特征列，按类别分组
+    spatial_features = [col for col in df.columns if any(substr in col for substr in 
+                        ['physical_distance', 'pitch_interval', 'key_transition', 'curr_black_key'])]
+    
+    temporal_features = [col for col in df.columns if any(substr in col for substr in 
+                         ['note_duration', 'ioi', 'overlap'])]
+    
+    hand_features = [col for col in df.columns if any(substr in col for substr in 
+                      ['hand_switch', 'stretch_rate'])]
+    
+    fingering_features = [col for col in df.columns if any(substr in col for substr in 
+                          ['natural_violation', 'finger_strength_violation', 'cross_dist', 'thumb_black_cross'])]
+    
+    # 所有物理特征
+    physical_features = spatial_features + temporal_features + hand_features + fingering_features
+    
+    # 最终使用的特征列表
+    feature_columns = base_features + physical_features
+    
+    print(f"使用的特征集:")
+    print(f"- 基础特征: {len(base_features)} 个")
+    print(f"- 空间特征: {len(spatial_features)} 个")
+    print(f"- 时间特征: {len(temporal_features)} 个")
+    print(f"- 手部特征: {len(hand_features)} 个")
+    print(f"- 指法特征: {len(fingering_features)} 个")
+    print(f"- 总特征数: {len(feature_columns)} 个")
+    
+    # 保存当前处理的DataFrame
+    save_pickle(df, "df_features.pkl")
+    
+    # 决定是否使用word2vec和CRF
+    use_word2vec = False  # 设置为False禁用word2vec特征
+    use_crf = False       # 设置为False禁用CRF特征
+    
+    # 条件性Word2Vec处理
+    if use_word2vec:
+        print("使用Word2Vec进行特征增强...")
+        df = create_word_column(df, feature_columns)
+        print("部分 'word' 列样例：")
+        print(df['word'].head())
+        
+        # 训练 Word2Vec-CBOW 模型
+        tokenized_sentences = df['word'].apply(lambda x: x.split()).tolist()
+        word2vec_model = train_word2vec(tokenized_sentences, window=2, vector_size=64, min_count=1, workers=4)
+        
+        # 保存模型
+        word2vec_model.save("word2vec_cbow.model")
+        print("Word2Vec 模型已训练并保存。")
+        
+        # 获取融合特征
+        df = get_fused_features(df, word2vec_model, tokenized_sentences)
+        
+        # 将融合特征向量转化为多维特征
+        fused_features = np.vstack(df['fused_feature'].values)
+        
+        # 标准化融合特征
+        scaler_fused = StandardScaler()
+        fused_features_scaled = scaler_fused.fit_transform(fused_features)
+        
+        # 将融合特征添加到原始特征中
+        df['fused_feature_scaled'] = list(fused_features_scaled)
+    else:
+        print("跳过Word2Vec特征提取。")
+        df['fused_feature'] = [np.zeros(64) for _ in range(len(df))]
+    
+    # 条件性CRF处理
+    if use_crf:
+        print("使用CRF进行特征增强...")
+        # 应用CRF特征提取
+        df = extract_crf_features(df, sequence_length=10)
+    else:
+        print("跳过CRF特征提取。")
+        df['crf_feature'] = [[0.0] for _ in range(len(df))]
+    
+    # 在没有Word2Vec和CRF特征的情况下，直接使用物理特征
+    # 构建特征矩阵
+    X_features = []
+    for i, row in df.iterrows():
+        # 提取所有数值特征
+        feature_values = np.array([float(row[col]) for col in feature_columns])
+        
+        # 如果使用了Word2Vec或CRF，添加这些特征
+        if use_word2vec:
+            feature_values = np.concatenate([feature_values, row['fused_feature']])
+        
+        if use_crf:
+            feature_values = np.concatenate([feature_values, row['crf_feature']])
+        
+        X_features.append(feature_values)
+    
+    # 转换为numpy数组
+    X = np.array(X_features)
     y = df['fingering_encoded'].values
-
-    print(f"新特征形状: {X.shape}")
+    
+    print(f"特征矩阵形状: {X.shape}")
     print(f"标签形状: {y.shape}")
 
-    # 标准化数值特征（包括融合特征）
+    # 处理无限值和NaN
+    X = np.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
+    print("已将无限值和NaN替换为有限值")
+    
+    # 标准化数值特征
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
 
@@ -285,7 +357,7 @@ def main():
 
     X_seq, y_seq = create_sequences_full(X, y, sequence_length)
 
-    print(f"序列特征形状（包含融合特征）: {X_seq.shape}")  # (样本数, sequence_length, 特征数量)
+    print(f"序列特征形状（包含融合特征和物理约束）: {X_seq.shape}")  # (样本数, sequence_length, 特征数量)
     print(f"序列标签形状: {y_seq.shape}")  # (样本数,)
 
     # 划分训练集和验证集
