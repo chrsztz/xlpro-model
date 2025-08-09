@@ -1,0 +1,124 @@
+# CNN-BiLSTM模型配置文件
+# 基于论文 "CNN-BiLSTM Hybrid Model with Physical Constraints for Automatic Piano Fingering Generation"
+
+# 数据配置
+data:
+  data_dir: "./PIGdata"                    # PIG数据集路径
+  sequence_length: 75                      # 序列长度 (论文使用75)
+  batch_size: 64                          # 批大小 (论文使用64)
+  num_workers: 4                          # 数据加载进程数
+  train_split: 0.7                        # 训练集比例
+  val_split: 0.15                         # 验证集比例
+  test_split: 0.15                        # 测试集比例
+
+# 模型配置
+model:
+  # 基础参数
+  input_dim: 5                             # 基础特征维度
+  hidden_size: 128                        # 隐藏层大小 (论文使用128)
+  num_classes: 11                         # 指法类别数 (-5到5)
+  
+  # CNN参数
+  num_cnn_layers: 2                       # CNN层数 (论文使用2)
+  
+  # BiLSTM参数  
+  num_lstm_layers: 2                      # BiLSTM层数 (论文使用2)
+  
+  # 正则化
+  dropout_rate: 0.3                       # Dropout率 (论文使用0.3-0.4)
+  use_batch_norm: true                    # 是否使用批归一化
+  
+  # 物理约束
+  physical_features_dim: 5                # 物理约束特征维度
+  physical_weight: 0.3                    # 物理约束权重λ (论文使用0.3)
+  
+  # 注意力机制
+  use_attention: true                     # 是否使用注意力机制
+  attention_dim: 128                      # 注意力计算维度
+
+# 训练配置
+training:
+  # 优化器
+  optimizer: "adam"                       # 优化器 (论文使用Adam)
+  learning_rate: 0.001                   # 学习率 (论文使用0.001)
+  weight_decay: 1e-5                     # 权重衰减 (论文使用1e-5)
+  
+  # 学习率调度
+  lr_scheduler: "plateau"                 # 学习率调度器
+  lr_patience: 5                         # 学习率衰减耐心值
+  lr_factor: 0.5                         # 学习率衰减因子
+  
+  # 训练控制
+  num_epochs: 30                         # 训练轮数 (论文使用30)
+  early_stopping_patience: 10           # 早停耐心值 (论文使用10)
+  gradient_clip_norm: 1.0                # 梯度裁剪
+  
+  # 验证和保存
+  validate_every: 1                      # 验证频率
+  save_every: 5                          # 模型保存频率
+  
+# 前向规划配置
+forward_planning:
+  use_planning: true                     # 是否使用前向规划
+  planning_depth: 3                      # 规划深度 (论文使用3)
+  top_k_candidates: 3                    # Top-k候选数 (论文使用3)
+
+# 物理约束配置
+physical_constraints:
+  velocity_threshold: 80.0               # 力度阈值τ
+  finger_weights:                        # 手指权重ω_f
+    "1": 1.0    # 拇指
+    "2": 1.0    # 食指
+    "3": 1.0    # 中指
+    "4": 1.2    # 无名指 (较弱)
+    "5": 1.5    # 小指 (最弱)
+    "-1": 1.0   # 左手拇指
+    "-2": 1.0   # 左手食指
+    "-3": 1.0   # 左手中指
+    "-4": 1.2   # 左手无名指
+    "-5": 1.5   # 左手小指
+
+# 评估配置
+evaluation:
+  metrics:
+    - "Mgen"      # 通用匹配率
+    - "Mhigh"     # 最高匹配率
+    - "Msoft"     # 软匹配准确率
+    - "Mcp"       # 手位变化率
+  
+  # 评估设置
+  eval_batch_size: 32
+  save_predictions: true
+  save_attention_weights: true
+
+# 实验配置
+experiment:
+  name: "cnn_bilstm_physical_constraints"
+  save_dir: "./experiments"
+  log_dir: "./logs"
+  
+  # 随机种子
+  seed: 42
+  
+  # 设备配置
+  device: "auto"                         # auto, cpu, cuda
+  mixed_precision: true                  # 是否使用混合精度训练
+  
+  # 日志配置
+  log_level: "INFO"
+  wandb:
+    enabled: false                       # 是否启用wandb
+    project: "piano-fingering"
+    entity: null
+
+# 推理配置
+inference:
+  model_path: null                       # 模型路径
+  output_format: "midi"                  # 输出格式: midi, xml, json
+  visualization: true                    # 是否生成可视化
+  
+  # 手部分离配置 (使用PianoHands.jl)
+  hand_separation:
+    enabled: true
+    pianohands_path: "./PianoHands.jl"
+    model_path: "./PianoHands.jl/model/model-0.92091.jld2" 
