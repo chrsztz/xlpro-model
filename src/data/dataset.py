@@ -29,7 +29,8 @@ class PianoFingeringDataset(Dataset):
         data_dir: Union[str, Path],
         split: str = "train",
         sequence_length: int = 75,
-        transform=None
+        transform=None,
+        max_pieces: Optional[int] = None
     ):
         """
         初始化数据集
@@ -39,11 +40,13 @@ class PianoFingeringDataset(Dataset):
             split: 数据分割 ('train', 'val', 'test')
             sequence_length: 序列长度(论文中使用75)
             transform: 数据变换函数
+            max_pieces: 最大作品数量(用于演示)
         """
         self.data_dir = Path(data_dir)
         self.split = split
         self.sequence_length = sequence_length
         self.transform = transform
+        self.max_pieces = max_pieces
         
         # 加载数据文件列表
         self.fingering_files = self._get_file_list()
@@ -64,6 +67,10 @@ class PianoFingeringDataset(Dataset):
         
         # 按文件名排序以确保一致性
         files.sort()
+        
+        # 限制作品数量 (用于演示)
+        if self.max_pieces:
+            files = files[:self.max_pieces]
         
         # 分割数据集 (70% train, 15% val, 15% test)
         n_files = len(files)
@@ -275,6 +282,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
     sequences = []
     labels = []
     metadata = []
+    raw_notes_batch = []
     
     for item in batch:
         notes = item['notes']
@@ -302,6 +310,8 @@ def collate_fn(batch: List[Dict]) -> Dict:
             'piece_name': item['piece_name'],
             'sequence_id': item['sequence_id']
         })
+        # 保留原始notes用于下游物理约束在线计算
+        raw_notes_batch.append(notes)
     
     # 转换为tensor
     features_tensor = torch.FloatTensor(sequences)
@@ -310,5 +320,6 @@ def collate_fn(batch: List[Dict]) -> Dict:
     return {
         'features': features_tensor,
         'labels': labels_tensor,
-        'metadata': metadata
+        'metadata': metadata,
+        'notes': raw_notes_batch
     } 

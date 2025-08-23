@@ -4,4 +4,9 @@
 包含模型训练相关功能
 """
 
-# 暂时为空，后续实现训练功能时添加 
+from .trainer import Trainer, create_trainer
+
+__all__ = [
+    "Trainer",
+    "create_trainer"
+] 

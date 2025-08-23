@@ -1,0 +1,40 @@
+{
+  "dataset_summary": {
+    "total_sequences": 2237,
+    "total_notes": 167775,
+    "splits": {
+      "train": {
+        "sequences": 1650,
+        "notes": 123750,
+        "avg_length": 75.0
+      },
+      "val": {
+        "sequences": 322,
+        "notes": 24150,
+        "avg_length": 75.0
+      },
+      "test": {
+        "sequences": 265,
+        "notes": 19875,
+        "avg_length": 75.0
+      }
+    }
+  },
+  "finger_distribution": {
+    "1": 24133,
+    "2": 21721,
+    "3": 17978,
+    "4": 12980,
+    "-5": 16921,
+    "-4": 8034,
+    "-3": 11106,
+    "-2": 16383,
+    "5": 13940,
+    "-1": 24579
+  },
+  "hand_distribution": {
+    "left": 77023,
+    "right": 90752
+  },
+  "quality_checks": []
+}

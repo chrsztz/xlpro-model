@@ -1,0 +1,78 @@
+data:
+  batch_size: 16
+  data_dir: PIGdata
+  num_workers: 4
+  sequence_length: 75
+  test_split: 0.15
+  train_split: 0.7
+  val_split: 0.15
+evaluation:
+  eval_batch_size: 32
+  metrics:
+  - Mgen
+  - Mhigh
+  - Msoft
+  - Mcp
+  save_attention_weights: true
+  save_predictions: true
+experiment:
+  device: auto
+  log_dir: checkpoints/logs
+  log_level: INFO
+  mixed_precision: true
+  name: experiment_20250821_192743
+  save_dir: checkpoints
+  seed: 42
+  wandb:
+    enabled: false
+    entity: null
+    project: piano-fingering
+forward_planning:
+  planning_depth: 3
+  top_k_candidates: 3
+  use_planning: true
+inference:
+  hand_separation:
+    enabled: true
+    model_path: ./PianoHands.jl/model/model-0.92091.jld2
+    pianohands_path: ./PianoHands.jl
+  model_path: null
+  output_format: midi
+  visualization: true
+model:
+  attention_dim: 128
+  dropout_rate: 0.3
+  hidden_size: 128
+  input_dim: 5
+  num_classes: 11
+  num_cnn_layers: 2
+  num_lstm_layers: 2
+  physical_features_dim: 5
+  physical_weight: 0.3
+  use_attention: true
+  use_batch_norm: true
+physical_constraints:
+  finger_weights:
+    '-1': 1.0
+    '-2': 1.0
+    '-3': 1.0
+    '-4': 1.2
+    '-5': 1.5
+    '1': 1.0
+    '2': 1.0
+    '3': 1.0
+    '4': 1.2
+    '5': 1.5
+  velocity_threshold: 80.0
+training:
+  early_stopping_patience: 10
+  gradient_clip_norm: 1.0
+  learning_rate: 0.001
+  lr_factor: 0.5
+  lr_patience: 5
+  lr_scheduler: plateau
+  num_epochs: 30
+  optimizer: adam
+  save_every: 5
+  validate_every: 1
+  weight_decay: 1.0e-05

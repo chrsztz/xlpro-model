@@ -1,0 +1,74 @@
+{
+  "data_dir": "/Users/ztz/Desktop/xlpro-model/PIGdata",
+  "sequence_length": 75,
+  "splits": {
+    "train": {
+      "num_sequences": 1650,
+      "total_notes": 123750,
+      "avg_sequence_length": 75.0,
+      "finger_distribution": {
+        "1": 17425,
+        "2": 16258,
+        "3": 14046,
+        "4": 9261,
+        "-5": 12391,
+        "-4": 6072,
+        "-3": 8673,
+        "-2": 12152,
+        "5": 9467,
+        "-1": 18005
+      },
+      "hand_distribution": {
+        "left": 57293,
+        "right": 66457
+      }
+    },
+    "val": {
+      "num_sequences": 322,
+      "total_notes": 24150,
+      "avg_sequence_length": 75.0,
+      "finger_distribution": {
+        "4": 2130,
+        "3": 2075,
+        "2": 2986,
+        "-4": 1086,
+        "1": 3677,
+        "-2": 2268,
+        "-1": 3514,
+        "5": 2521,
+        "-5": 2643,
+        "-3": 1250
+      },
+      "hand_distribution": {
+        "left": 10761,
+        "right": 13389
+      }
+    },
+    "test": {
+      "num_sequences": 265,
+      "total_notes": 19875,
+      "avg_sequence_length": 75.0,
+      "finger_distribution": {
+        "4": 1589,
+        "-2": 1963,
+        "5": 1952,
+        "-1": 3060,
+        "3": 1857,
+        "1": 3031,
+        "-4": 876,
+        "2": 2477,
+        "-3": 1183,
+        "-5": 1887
+      },
+      "hand_distribution": {
+        "left": 8969,
+        "right": 10906
+      }
+    },
+    "total": {
+      "sequences": 2237,
+      "notes": 167775
+    }
+  },
+  "timestamp": "2025-08-21 19:28:09.511921"
+}

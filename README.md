@@ -139,34 +139,68 @@ PIGdata/
 
 ### 2. 训练模型
 
+```bash
+# 使用训练脚本
+python scripts/train_model.py
+
+# 或者自定义参数
+python scripts/train_model.py --data_dir PIGdata --device mps
+```
+
 ```python
-from src.training import train_model
+# 或使用Python API
+from src.training import create_trainer
 from src.models import create_model
+from src.data import PianoFingeringDataset
 import yaml
 
 # 加载配置
 with open('configs/model_config.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
+# 创建数据集
+train_dataset = PianoFingeringDataset('PIGdata', split='train')
+val_dataset = PianoFingeringDataset('PIGdata', split='val')
+
 # 创建和训练模型
 model = create_model(config['model'])
-train_model(model, config)
+trainer = create_trainer(model, config)
+history = trainer.train(train_dataset, val_dataset)
 ```
 
 ### 3. 推理
 
+```bash
+# 使用推理脚本
+python scripts/predict_fingering.py input.mid
+
+# 指定输出格式
+python scripts/predict_fingering.py input.mid --format json --output result.json
+
+# 生成可视化HTML
+python scripts/predict_fingering.py input.mid --format html
+```
+
 ```python
-from src.inference import FingeringPredictor
+# 或使用Python API
+from src.inference import create_predictor
 
 # 创建预测器
-predictor = FingeringPredictor(
-    model_path='path/to/trained_model.pth',
+predictor = create_predictor(
+    model_path='experiments/cnn_bilstm_physical_constraints/best_model.pth',
     config_path='configs/model_config.yaml'
 )
 
 # 预测MIDI文件指法
-fingering = predictor.predict_midi('input.mid')
-predictor.save_result(fingering, 'output.mid')
+result = predictor.predict_midi('input.mid')
+predictor.save_result(result, 'output.mid', format='midi')
+
+# 批量预测
+output_files = predictor.batch_predict(
+    ['song1.mid', 'song2.mid'], 
+    'output_dir/', 
+    format='json'
+)
 ```
 
 ## 论文对应实现
@@ -231,8 +265,8 @@ training:
 - [x] 数据加载和预处理
 - [x] CNN-BiLSTM模型实现
 - [x] 物理约束计算
-- [ ] 训练pipeline
-- [ ] 推理系统
+- [x] 训练pipeline
+- [x] 推理系统
 - [ ] 评估指标
 - [ ] 可视化界面
 - [ ] 性能优化

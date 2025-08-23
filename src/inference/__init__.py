@@ -4,4 +4,13 @@
 包含模型推理相关功能
 """
 
-# 暂时为空，后续实现推理功能时添加 
+from .predictor import FingeringPredictor, create_predictor
+from .midi_processor import MIDIProcessor
+from .output_formatter import OutputFormatter
+
+__all__ = [
+    "FingeringPredictor",
+    "create_predictor",
+    "MIDIProcessor",
+    "OutputFormatter"
+] 
